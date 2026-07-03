@@ -64,7 +64,6 @@ type ResearchWebGraphProps = {
 type NodeVisual = { a: number; s: number; hl: number; dim: number; la: number; sel: number };
 type LinkVisual = { a: number; w: number; h: number };
 
-const AUTO_EXPAND_MAX = 16;
 const EASE = 0.09;
 
 // Monet "San Giorgio Maggiore at Dusk": dusk sun → water reflection.
@@ -143,17 +142,10 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
   const hoverRef = useRef<string | null>(null);
   const selectedRef = useRef<string | null>(null);
   const centerRef = useRef<{ x: number; y: number; maxR: number }>({ x: 0, y: 0, maxR: 1 });
-  const autoQueueRef = useRef<string[]>([]);
-  const autoCountRef = useRef(0);
-  const autoTimerRef = useRef<number | null>(null);
   const userInteractedRef = useRef(false);
   const framedRef = useRef(false);
-  // Pinning must wait until the initial layout has spread out, or auto-expand
-  // would freeze the whole web while it's still collapsed near the origin.
-  const seedSettledRef = useRef(false);
   const seedTokenRef = useRef(0);
   const cardDragRef = useRef<{ dx: number; dy: number } | null>(null);
-  const draggingNodeRef = useRef<GraphNode | null>(null);
 
   const [graphData, setGraphData] = useState<{ nodes: GraphNode[]; links: GraphLink[] }>({ nodes: [], links: [] });
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -211,54 +203,12 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
     }, 680);
   }, []);
 
-  // Pin every node at its current position (dead‑calm at rest).
-  const freezeAll = useCallback(() => {
-    nodesRef.current.forEach((node) => {
-      if (typeof node.x === 'number' && typeof node.y === 'number') {
-        node.fx = node.x;
-        node.fy = node.y;
-      }
-    });
-  }, []);
-
-  // During a drag, only the dragged node's DIRECT neighbours are free to follow
-  // it — the rest of the (dense) web stays pinned so it can't shimmer. This keeps
-  // the drag feeling connected without the whole simulation vibrating.
-  const freezeExceptNeighbors = useCallback((node: GraphNode) => {
-    const neighbours = neighborsRef.current.get(node.id);
-    nodesRef.current.forEach((other) => {
-      if (other === node) return;
-      if (neighbours && neighbours.has(other.id)) {
-        other.fx = undefined;
-        other.fy = undefined;
-      } else if (typeof other.x === 'number' && typeof other.y === 'number') {
-        other.fx = other.x;
-        other.fy = other.y;
-      }
-    });
-  }, []);
-
   const mergeGraph = useCallback(
-    (data: GraphResponse, origin?: GraphNode, stabilize = false) => {
-      // Adding nodes reheats d3's simulation to full alpha, which otherwise
-      // yanks the whole layout around. Pin the existing nodes at their current
-      // positions so only the newcomers move — the web *grows* instead of
-      // reshuffling. Pins are released a couple seconds after growth stops.
-      // Skip while a drag is active, or before the seed layout has spread —
-      // pinning too early would lock the web into its collapsed initial state.
-      const shouldPin = stabilize && !draggingNodeRef.current && seedSettledRef.current;
-      if (shouldPin) {
-        nodesRef.current.forEach((node) => {
-          if (typeof node.x === 'number' && typeof node.y === 'number') {
-            node.fx = node.x;
-            node.fy = node.y;
-          }
-        });
-      }
-
-      // With a parent, newcomers emerge right beside it and ease out along
-      // their links. For a bulk/seed load (no parent) pre-spread them across a
-      // wide disk so the layout starts open instead of exploding from a point.
+    (data: GraphResponse, origin?: GraphNode) => {
+      // Place nodes, then let the live force simulation arrange them. A bulk /
+      // seed load (no parent) is pre-spread across a wide disk so it opens up
+      // instead of exploding from a point; expansion nodes appear beside their
+      // parent and are drawn into place by their new links.
       const bulkRadius = origin ? 0 : Math.max(180, Math.sqrt(data.nodes.length) * 12);
 
       data.nodes.forEach((incoming) => {
@@ -271,14 +221,12 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
           existing.expanded = existing.expanded || incoming.expanded;
         } else {
           const angle = Math.random() * Math.PI * 2;
-          const distance = origin ? 10 + Math.random() * 22 : Math.sqrt(Math.random()) * bulkRadius;
+          const distance = origin ? 12 + Math.random() * 24 : Math.sqrt(Math.random()) * bulkRadius;
           nodesRef.current.set(incoming.pmid, {
             ...incoming,
             id: incoming.pmid,
             x: (origin?.x ?? 0) + Math.cos(angle) * distance,
-            y: (origin?.y ?? 0) + Math.sin(angle) * distance,
-            vx: 0,
-            vy: 0
+            y: (origin?.y ?? 0) + Math.sin(angle) * distance
           } as GraphNode);
         }
       });
@@ -291,8 +239,6 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
       });
 
       commitGraph();
-      // Pins persist so additions never disturb the existing layout — the web
-      // only ever grows. A drag releases them for physics (see onNodeDrag).
     },
     [commitGraph]
   );
@@ -338,7 +284,7 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
       expandedDepthRef.current.set(pmid, depth);
       try {
         const data = await fetchGraph(pmid, depth, cap);
-        mergeGraph(data, nodesRef.current.get(pmid), true);
+        mergeGraph(data, nodesRef.current.get(pmid));
         const node = nodesRef.current.get(pmid);
         if (node) node.expanded = true;
         return true;
@@ -350,37 +296,6 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
     [fetchGraph, mergeGraph]
   );
 
-  // ---- Background auto-expansion: quietly deepen the web (and the shared DB)
-  // one stub at a time so exploration never hits a wall.
-  const pumpAutoExpand = useCallback(() => {
-    if (autoTimerRef.current) window.clearTimeout(autoTimerRef.current);
-    const token = seedTokenRef.current;
-
-    const step = async () => {
-      if (token !== seedTokenRef.current) return;
-      if (autoCountRef.current >= AUTO_EXPAND_MAX) return;
-      if (document.hidden) {
-        autoTimerRef.current = window.setTimeout(step, 4000);
-        return;
-      }
-      const next = autoQueueRef.current.shift();
-      if (!next) return;
-      const grew = await expandGraphFrom(next, 1, 8);
-      if (grew) {
-        autoCountRef.current += 1;
-        // Keep it centered while filling; don't re-zoom once framed.
-        if (token === seedTokenRef.current && !userInteractedRef.current && !framedRef.current) {
-          graphRef.current?.zoomToFit(700, 40);
-        }
-      }
-      // Hurry while the web is still sparse; relax once it fills out.
-      const delay = nodesRef.current.size < 80 ? 500 : 1400;
-      autoTimerRef.current = window.setTimeout(step, delay);
-    };
-
-    autoTimerRef.current = window.setTimeout(step, 2200);
-  }, [expandGraphFrom]);
-
   const loadSeed = useCallback(
     async (pmid: string) => {
       const token = ++seedTokenRef.current;
@@ -391,18 +306,19 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
       selectedRef.current = null;
       setSelectedDetail(null);
 
-      draggingNodeRef.current = null;
+      // Only clear the canvas when RE-loading (switching seeds). On the very
+      // first load the graph is already empty; setting it to another empty
+      // object first can leave react-force-graph's engine in a stopped state
+      // that doesn't restart when the real data arrives.
+      const isReload = nodesRef.current.size > 0;
       nodesRef.current = new Map();
       linksRef.current = new Map();
       expandedDepthRef.current = new Map();
       nodeVisualsRef.current = new Map();
       linkVisualsRef.current = new Map();
-      autoQueueRef.current = [];
-      autoCountRef.current = 0;
       userInteractedRef.current = false;
       framedRef.current = false;
-      seedSettledRef.current = false;
-      setGraphData({ nodes: [], links: [] });
+      if (isReload) setGraphData({ nodes: [], links: [] });
 
       try {
         // Main page: the seed's 4-degree neighbourhood (pre-crawled in Neon).
@@ -411,33 +327,33 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
         expandedDepthRef.current.set(pmid, 4);
         mergeGraph(data);
 
-        // Queue un-expanded stubs (closest first) for gentle background growth.
-        autoQueueRef.current = data.nodes
-          .filter((node) => !node.expanded && node.depth <= 3)
-          .sort((a, b) => a.depth - b.depth)
-          .map((node) => node.pmid);
-        pumpAutoExpand();
+        // react-force-graph doesn't always start its engine on the first data
+        // load (so the layout would only settle on the first click that reheats
+        // it). Explicitly kick the simulation once the nodes are in — across a
+        // couple of frames to beat any processing race — so it flows into place
+        // on load.
+        [80, 400].forEach((wait) => {
+          window.setTimeout(() => {
+            if (token === seedTokenRef.current) graphRef.current?.d3ReheatSimulation?.();
+          }, wait);
+        });
 
-        // Let the layout flow into place; keep it centered as it settles, then
-        // lock in the zoomed-in framing once the bulk has arranged itself.
-        [700, 1800, 3400].forEach((wait) => {
+        // Keep it centred as the simulation flows into place; the final
+        // zoomed-in framing lands in onEngineStop once it settles (with a
+        // fallback timer in case a big graph never fully cools).
+        [800, 2200, 4200].forEach((wait) => {
           window.setTimeout(() => {
             if (token === seedTokenRef.current && !userInteractedRef.current && !framedRef.current) {
               graphRef.current?.zoomToFit(650, 40);
             }
           }, wait);
         });
-        // The layout has spread by now — from here, additions pin the existing
-        // web in place so it grows smoothly instead of reshuffling.
         window.setTimeout(() => {
-          if (token === seedTokenRef.current) seedSettledRef.current = true;
-        }, 4200);
-        window.setTimeout(() => {
-          if (token === seedTokenRef.current && !userInteractedRef.current) {
+          if (token === seedTokenRef.current && !userInteractedRef.current && !framedRef.current) {
             framedRef.current = true;
             frameGraph(true);
           }
-        }, 5200);
+        }, 8000);
       } catch (fetchError) {
         if (token === seedTokenRef.current) {
           setError(fetchError instanceof Error ? fetchError.message : 'Could not build the graph.');
@@ -451,14 +367,11 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
         }
       }
     },
-    [fetchGraph, mergeGraph, pumpAutoExpand]
+    [fetchGraph, mergeGraph, frameGraph]
   );
 
   useEffect(() => {
     void loadSeed(seedPmid);
-    return () => {
-      if (autoTimerRef.current) window.clearTimeout(autoTimerRef.current);
-    };
   }, [loadSeed, seedPmid]);
 
   useEffect(() => {
@@ -505,15 +418,17 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
     };
   }, []);
 
-  // Live Obsidian-style physics tuned for calm: neighbours follow a dragged
-  // node, but the link spring is soft (low strength) so motion glides to rest
-  // without overshooting/oscillating — responsive, never jittery.
+  // Obsidian-style force layout: particles repel (charge), links are springs,
+  // a gentle centre keeps it in frame. The link force keeps d3's DEFAULT
+  // per-link strength (1 / min-degree) so hubs stay loose and dense groups
+  // pull into clusters. The simulation cools to a real rest (see alphaDecay)
+  // so it's still once settled — no perpetual motion.
   useEffect(() => {
     const graph = graphRef.current;
     if (!graph || graphData.nodes.length === 0) return;
-    graph.d3Force('charge')?.strength(-52).distanceMax(320);
-    graph.d3Force('link')?.distance(32).strength(0.42);
-    graph.d3Force('center')?.strength(0.045);
+    graph.d3Force('charge')?.strength(-90).distanceMax(600);
+    graph.d3Force('link')?.distance(38);
+    graph.d3Force('center')?.strength(0.03);
   }, [graphData.nodes.length]);
 
   const selectArticle = useCallback(
@@ -791,38 +706,34 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
           linkCanvasObject={drawLink}
           linkCanvasObjectMode={() => 'replace'}
           autoPauseRedraw={false}
-          d3AlphaDecay={0.025}
-          d3VelocityDecay={0.6}
+          d3AlphaDecay={0.0228}
+          d3VelocityDecay={0.4}
           warmupTicks={0}
-          cooldownTime={6000}
+          cooldownTicks={Infinity}
           onRenderFramePre={updateCentroid}
           onNodeHover={(node: GraphNode | null) => {
             hoverRef.current = node ? node.id : null;
             document.body.style.cursor = node ? 'pointer' : '';
           }}
           onNodeClick={(node: GraphNode) => selectArticle(node.id)}
-          onNodeDrag={(node: GraphNode) => {
-            // Only direct neighbours follow; the rest of the web is frozen so it
-            // can't shimmer. Soft springs make the local follow-motion glide.
-            if (draggingNodeRef.current !== node) {
-              draggingNodeRef.current = node;
-              userInteractedRef.current = true;
-              freezeExceptNeighbors(node);
-            }
+          onNodeDrag={() => {
+            // react-force-graph fixes the dragged node and reheats the sim;
+            // neighbours respond through the springs. We just flag interaction
+            // so auto-framing stops fighting the user.
+            userInteractedRef.current = true;
           }}
           onNodeDragEnd={(node: GraphNode) => {
-            // Keep the node where it was dropped, then re-freeze everything so
-            // the graph is completely still until the next interaction.
-            node.fx = node.x;
-            node.fy = node.y;
-            draggingNodeRef.current = null;
-            freezeAll();
+            // Release the node so it rejoins the simulation and settles among
+            // its neighbours (a live force layout, Obsidian-style).
+            node.fx = undefined;
+            node.fy = undefined;
           }}
           onBackgroundClick={() => setSelectedId(null)}
           onEngineStop={() => {
-            // Keep it centered if physics settles before the framing timer fires.
+            // Physics has settled to rest — lock in the framing once.
             if (userInteractedRef.current || framedRef.current) return;
-            graphRef.current?.zoomToFit(600, 40);
+            framedRef.current = true;
+            frameGraph(true);
           }}
         />
       </div>

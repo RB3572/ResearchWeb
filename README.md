@@ -179,26 +179,37 @@ serverless timeout. Returns `{ expanded, logs }`.
   edges (harder in portrait so mobile fills top‑to‑bottom). It runs once after the
   layout settles and never fights the user once they interact.
 
-### Calm, un‑jittery physics
-The repeated design requirement was **no jitter / no sudden acceleration**. This is
-achieved with three mechanisms:
+### Physics — a real Obsidian‑style force simulation
+The layout is a genuine live force‑directed simulation (d3‑force via
+`react-force-graph`), not a scripted animation:
 
-1. **Soft, heavily‑damped forces** — low link‑spring strength (`0.3`) plus high
-   velocity damping (`d3VelocityDecay = 0.62`). Motion is slow and never oscillates.
-2. **Pinning on growth** — adding nodes normally reheats d3's simulation and jerks
-   the whole layout. Instead, before every incremental merge the existing nodes are
-   pinned at their current positions (`fx/fy`), so only the *new* nodes move — the web
-   grows outward from a parent instead of reshuffling. (Verified: 0.00px movement of
-   existing nodes across additions.) Pinning waits until the initial layout has
-   spread (`seedSettledRef`) so it can't freeze a still‑collapsing seed.
-3. **Freeze on drag** — the moment a drag begins, every other node is frozen in place,
-   so nothing around the dragged node can vibrate; the node stays where it's dropped.
+- **Charge (repulsion)** — every node pushes every other away
+  (`strength = -90`, `distanceMax = 600`) so nodes don't pile up.
+- **Link (springs)** — connected papers are pulled together
+  (`distance = 38`). The link force keeps d3's **default per‑link strength**
+  (`1 / min‑degree`), which is what makes hubs stay loose and densely‑connected
+  groups pull into visible **clusters** (fields / subfields).
+- **Centre** — a gentle pull (`strength = 0.03`) keeps the graph in frame.
+- **Damping** — `d3VelocityDecay = 0.4` (d3/Obsidian default) provides
+  friction so the graph eases to rest instead of bouncing forever.
+- **Cools to a true rest** — `d3AlphaDecay = 0.0228`, `cooldownTicks = Infinity`:
+  the "temperature" decays until the layout reaches an energy minimum, then the
+  engine stops. Once settled it is **completely still** (verified: 0.00px/frame) —
+  there is no perpetual jitter.
+
+The important lesson learned: the earlier "jitter" was **self‑inflicted** — a
+background auto‑expander kept injecting nodes, which reheated the simulation every
+couple of seconds so it never rested. That foreground auto‑expansion was removed;
+the shared database still grows invisibly via `/api/pubmed/expand`. Dragging a node
+perturbs it and the whole web responds through the springs, then re‑settles — a live
+low‑energy arrangement, exactly like Obsidian. On drag‑release the node rejoins the
+simulation (`fx/fy` cleared).
 
 ### Selection & exploration
 Clicking a node (or a row in the card) opens the detail card, recenters, and expands
-**≥3 degrees** out from that node (merged into the current web). A depth map
-(`expandedDepthRef`) lets a click deepen a node that was only shallowly touched by
-background auto‑expansion.
+**≥3 degrees** out from that node (merged into the current web, which re‑settles). A
+depth map (`expandedDepthRef`) lets a click deepen a node touched only shallowly
+before.
 
 ### Painting
 Everything on the canvas is drawn by hand with per‑node / per‑link **eased** visual
