@@ -99,6 +99,7 @@ function mergeGraph(existing: GraphData, incomingNodes: PaperNode[], incomingLin
 export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
   const graphElRef = useRef<HTMLDivElement | null>(null);
   const graphInstanceRef = useRef<any>(null);
+  const graphDataRef = useRef<GraphData>({ nodes: [makeSeedNode(seedPmid)], links: [] });
   const selectedIdRef = useRef<string | null>(seedPmid);
   const focusIdsRef = useRef<Set<string>>(new Set([seedPmid]));
   const selectNodeRef = useRef<(node: PaperNode) => void>(() => {});
@@ -147,12 +148,14 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
   }, [graphData.links, selectedId]);
 
   useEffect(() => {
+    graphDataRef.current = graphData;
     selectedIdRef.current = selectedId;
     focusIdsRef.current = focusIds;
 
     const graph = graphInstanceRef.current;
     if (graph) {
       graph.graphData(graphData);
+      graph.refresh?.();
     }
   }, [focusIds, graphData, selectedId]);
 
@@ -221,7 +224,9 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
   }, [seedPmid]);
 
   useEffect(() => {
-    setGraphData({ nodes: [makeSeedNode(seedPmid)], links: [] });
+    const nextData = { nodes: [makeSeedNode(seedPmid)], links: [] };
+    graphDataRef.current = nextData;
+    setGraphData(nextData);
     setSelectedId(seedPmid);
     setStatus('Loading seed article');
     setError(null);
@@ -260,7 +265,7 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
 
   useEffect(() => {
     let destroyed = false;
-    let graph: any;
+    let removeResizeListener: (() => void) | undefined;
 
     async function initializeGraph() {
       if (!graphElRef.current || graphInstanceRef.current) return;
@@ -269,7 +274,7 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
       if (destroyed || !graphElRef.current) return;
 
       const ForceGraph3D = module.default || module;
-      graph = ForceGraph3D()(graphElRef.current);
+      const graph = ForceGraph3D()(graphElRef.current);
       graphInstanceRef.current = graph;
 
       const isNodeFocused = (node: PaperNode) => {
@@ -294,14 +299,14 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
           if (node.isSeed) return 13;
           return node.val;
         })
-        .nodeResolution(24)
+        .nodeResolution(28)
         .nodeColor((node: PaperNode) => {
           if (node.failed) return '#ffb4b4';
           if (node.id === selectedIdRef.current) return '#ffffff';
           if (node.isSeed) return '#d6ddff';
           return isNodeFocused(node) ? '#aebee8' : '#293041';
         })
-        .nodeOpacity((node: PaperNode) => (isNodeFocused(node) ? 0.96 : 0.14))
+        .nodeOpacity((node: PaperNode) => (isNodeFocused(node) ? 0.98 : 0.14))
         .nodeLabel((node: PaperNode) => {
           const authors = node.authors.length ? node.authors.slice(0, 3).join(', ') : 'Unknown authors';
           const date = node.year ? ` (${node.year})` : '';
@@ -316,14 +321,14 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
         .enableNodeDrag(true)
         .onNodeClick((node: PaperNode) => selectNodeRef.current(node))
         .onBackgroundClick(() => setSelectedId(null))
-        .graphData(graphData);
+        .graphData(graphDataRef.current);
 
       graph.d3Force('charge')?.strength(-135);
       graph.d3Force('link')?.distance(92);
       graph.d3Force('center')?.strength?.(0.08);
 
       const scene = graph.scene?.();
-      if (scene && module) {
+      if (scene) {
         const three = await import('three');
         scene.fog = new three.FogExp2(0x050507, 0.0028);
       }
@@ -335,21 +340,20 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
 
       resize();
       window.addEventListener('resize', resize);
-
-      return () => window.removeEventListener('resize', resize);
+      removeResizeListener = () => window.removeEventListener('resize', resize);
     }
 
-    const cleanupPromise = initializeGraph();
+    void initializeGraph();
 
     return () => {
       destroyed = true;
-      cleanupPromise.then((cleanup) => cleanup?.()).catch(() => undefined);
+      removeResizeListener?.();
       if (graphInstanceRef.current?._destructor) {
         graphInstanceRef.current._destructor();
       }
       graphInstanceRef.current = null;
     };
-  }, [graphData]);
+  }, []);
 
   useEffect(() => {
     const graph = graphInstanceRef.current;
