@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 
 type PubMedArticle = {
   id: string;
@@ -20,9 +20,6 @@ type PaperNode = PubMedArticle & {
   loading?: boolean;
   failed?: boolean;
   val: number;
-  x?: number;
-  y?: number;
-  z?: number;
 };
 
 type PaperLink = {
@@ -34,6 +31,14 @@ type PaperLink = {
 type GraphData = {
   nodes: PaperNode[];
   links: PaperLink[];
+};
+
+type PositionedNode = PaperNode & {
+  px: number;
+  py: number;
+  scale: number;
+  blur: number;
+  focused: boolean;
 };
 
 type PubMedArticleResponse = {
@@ -96,40 +101,24 @@ function mergeGraph(existing: GraphData, incomingNodes: PaperNode[], incomingLin
   };
 }
 
-export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
-  const graphElRef = useRef<HTMLDivElement | null>(null);
-  const graphInstanceRef = useRef<any>(null);
-  const graphDataRef = useRef<GraphData>({ nodes: [makeSeedNode(seedPmid)], links: [] });
-  const selectedIdRef = useRef<string | null>(seedPmid);
-  const focusIdsRef = useRef<Set<string>>(new Set([seedPmid]));
-  const selectNodeRef = useRef<(node: PaperNode) => void>(() => {});
-  const expandedRef = useRef(new Set<string>());
-  const loadingRef = useRef(new Set<string>());
-  const hasFitGraphRef = useRef(false);
+function shortTitle(title: string, max = 44) {
+  if (title.length <= max) return title;
+  return `${title.slice(0, max - 1).trim()}…`;
+}
 
+export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
   const [graphData, setGraphData] = useState<GraphData>(() => ({ nodes: [makeSeedNode(seedPmid)], links: [] }));
   const [selectedId, setSelectedId] = useState<string | null>(seedPmid);
   const [status, setStatus] = useState('Loading seed article');
   const [error, setError] = useState<string | null>(null);
+  const [expandedIds, setExpandedIds] = useState<Set<string>>(() => new Set());
+  const [loadingIds, setLoadingIds] = useState<Set<string>>(() => new Set());
 
   const nodeById = useMemo(() => {
     return new Map(graphData.nodes.map((node) => [node.id, node]));
   }, [graphData.nodes]);
 
   const selectedNode = selectedId ? nodeById.get(selectedId) || null : null;
-
-  const selectedReferenceIds = useMemo(() => {
-    if (!selectedId) return [];
-    return graphData.links
-      .filter((link) => linkEndpointId(link.source) === selectedId)
-      .map((link) => linkEndpointId(link.target));
-  }, [graphData.links, selectedId]);
-
-  const selectedReferences = useMemo(() => {
-    return selectedReferenceIds
-      .map((id) => nodeById.get(id))
-      .filter((node): node is PaperNode => Boolean(node));
-  }, [nodeById, selectedReferenceIds]);
 
   const focusIds = useMemo(() => {
     const ids = new Set<string>();
@@ -147,22 +136,113 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
     return ids;
   }, [graphData.links, selectedId]);
 
-  useEffect(() => {
-    graphDataRef.current = graphData;
-    selectedIdRef.current = selectedId;
-    focusIdsRef.current = focusIds;
+  const selectedReferences = useMemo(() => {
+    if (!selectedId) return [];
+    return graphData.links
+      .filter((link) => linkEndpointId(link.source) === selectedId)
+      .map((link) => nodeById.get(linkEndpointId(link.target)))
+      .filter((node): node is PaperNode => Boolean(node));
+  }, [graphData.links, nodeById, selectedId]);
 
-    const graph = graphInstanceRef.current;
-    if (graph) {
-      graph.graphData(graphData);
-      graph.refresh?.();
+  const positionedNodes = useMemo(() => {
+    const width = 100;
+    const height = 100;
+    const centerX = 44;
+    const centerY = 50;
+    const selected = selectedId ? nodeById.get(selectedId) : null;
+    const connectedIds = selectedId ? Array.from(focusIds).filter((id) => id !== selectedId) : [];
+    const nonFocus = graphData.nodes.filter((node) => selectedId && !focusIds.has(node.id));
+    const nodeMap = new Map<string, PositionedNode>();
+
+    if (selected) {
+      nodeMap.set(selected.id, {
+        ...selected,
+        px: centerX,
+        py: centerY,
+        scale: selected.isSeed ? 1.38 : 1.24,
+        blur: 0,
+        focused: true
+      });
     }
-  }, [focusIds, graphData, selectedId]);
+
+    connectedIds.forEach((id, index) => {
+      const node = nodeById.get(id);
+      if (!node) return;
+      const total = Math.max(connectedIds.length, 1);
+      const angle = -Math.PI / 2 + (Math.PI * 2 * index) / total;
+      const radiusX = total <= 6 ? 24 : 30;
+      const radiusY = total <= 6 ? 25 : 31;
+      nodeMap.set(node.id, {
+        ...node,
+        px: centerX + Math.cos(angle) * radiusX,
+        py: centerY + Math.sin(angle) * radiusY,
+        scale: 0.92,
+        blur: 0,
+        focused: true
+      });
+    });
+
+    if (!selected && graphData.nodes.length > 0) {
+      graphData.nodes.forEach((node, index) => {
+        const total = Math.max(graphData.nodes.length, 1);
+        const angle = -Math.PI / 2 + (Math.PI * 2 * index) / total;
+        const radius = node.isSeed ? 0 : 30;
+        nodeMap.set(node.id, {
+          ...node,
+          px: centerX + Math.cos(angle) * radius,
+          py: centerY + Math.sin(angle) * radius,
+          scale: node.isSeed ? 1.25 : 0.9,
+          blur: 0,
+          focused: true
+        });
+      });
+    }
+
+    nonFocus.forEach((node, index) => {
+      if (nodeMap.has(node.id)) return;
+      const total = Math.max(nonFocus.length, 1);
+      const angle = Math.PI / 4 + (Math.PI * 2 * index) / total;
+      const radiusX = 38;
+      const radiusY = 39;
+      nodeMap.set(node.id, {
+        ...node,
+        px: centerX + Math.cos(angle) * radiusX,
+        py: centerY + Math.sin(angle) * radiusY,
+        scale: 0.62,
+        blur: 3.2,
+        focused: false
+      });
+    });
+
+    return Array.from(nodeMap.values()).map((node) => ({
+      ...node,
+      px: Math.max(9, Math.min(width - 9, node.px)),
+      py: Math.max(10, Math.min(height - 10, node.py))
+    }));
+  }, [focusIds, graphData.nodes, nodeById, selectedId]);
+
+  const positionedNodeById = useMemo(() => {
+    return new Map(positionedNodes.map((node) => [node.id, node]));
+  }, [positionedNodes]);
+
+  const visibleLinks = useMemo(() => {
+    return graphData.links
+      .map((link) => {
+        const sourceId = linkEndpointId(link.source);
+        const targetId = linkEndpointId(link.target);
+        const source = positionedNodeById.get(sourceId);
+        const target = positionedNodeById.get(targetId);
+        if (!source || !target) return null;
+        const focused = !selectedId || sourceId === selectedId || targetId === selectedId;
+        return { source, target, focused };
+      })
+      .filter((link): link is { source: PositionedNode; target: PositionedNode; focused: boolean } => Boolean(link));
+  }, [graphData.links, positionedNodeById, selectedId]);
 
   const expandArticle = useCallback(async (pmid: string, depth = 0) => {
-    if (expandedRef.current.has(pmid) || loadingRef.current.has(pmid)) return;
+    if (expandedIds.has(pmid) || loadingIds.has(pmid)) return;
 
-    loadingRef.current.add(pmid);
+    setLoadingIds((current) => new Set(current).add(pmid));
     setStatus(`Loading PMID ${pmid}`);
     setError(null);
     setGraphData((current) => ({
@@ -205,7 +285,7 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
         type: 'reference'
       }));
 
-      expandedRef.current.add(pmid);
+      setExpandedIds((current) => new Set(current).add(pmid));
       setGraphData((current) => mergeGraph(current, [articleNode, ...referenceNodes], links));
       setStatus(`${data.references.length} references loaded for PMID ${pmid}`);
     } catch (fetchError) {
@@ -219,158 +299,87 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
         )
       }));
     } finally {
-      loadingRef.current.delete(pmid);
+      setLoadingIds((current) => {
+        const next = new Set(current);
+        next.delete(pmid);
+        return next;
+      });
     }
-  }, [seedPmid]);
+  }, [expandedIds, loadingIds, seedPmid]);
 
   useEffect(() => {
-    const nextData = { nodes: [makeSeedNode(seedPmid)], links: [] };
-    graphDataRef.current = nextData;
-    setGraphData(nextData);
+    setGraphData({ nodes: [makeSeedNode(seedPmid)], links: [] });
     setSelectedId(seedPmid);
     setStatus('Loading seed article');
     setError(null);
-    hasFitGraphRef.current = false;
-    expandedRef.current.clear();
-    loadingRef.current.clear();
+    setExpandedIds(new Set());
+    setLoadingIds(new Set());
+  }, [seedPmid]);
+
+  useEffect(() => {
     void expandArticle(seedPmid, 0);
   }, [expandArticle, seedPmid]);
 
-  const focusCameraOnNode = useCallback((node: PaperNode) => {
-    const graph = graphInstanceRef.current;
-    if (!graph || typeof node.x !== 'number' || typeof node.y !== 'number' || typeof node.z !== 'number') {
-      return;
-    }
-
-    const distance = 150;
-    const length = Math.hypot(node.x, node.y, node.z) || 1;
-    const ratio = 1 + distance / length;
-
-    graph.cameraPosition(
-      { x: node.x * ratio, y: node.y * ratio, z: node.z * ratio },
-      { x: node.x, y: node.y, z: node.z },
-      850
-    );
-  }, []);
-
   const selectNode = useCallback((node: PaperNode) => {
     setSelectedId(node.id);
-    focusCameraOnNode(node);
     void expandArticle(node.id, node.depth);
-  }, [expandArticle, focusCameraOnNode]);
-
-  useEffect(() => {
-    selectNodeRef.current = selectNode;
-  }, [selectNode]);
-
-  useEffect(() => {
-    let destroyed = false;
-    let removeResizeListener: (() => void) | undefined;
-
-    async function initializeGraph() {
-      if (!graphElRef.current || graphInstanceRef.current) return;
-
-      const module = await import('3d-force-graph');
-      if (destroyed || !graphElRef.current) return;
-
-      const ForceGraph3D = module.default || module;
-      const graph = ForceGraph3D()(graphElRef.current);
-      graphInstanceRef.current = graph;
-
-      const isNodeFocused = (node: PaperNode) => {
-        const selected = selectedIdRef.current;
-        return !selected || focusIdsRef.current.has(node.id);
-      };
-
-      const isLinkFocused = (link: PaperLink) => {
-        const selected = selectedIdRef.current;
-        if (!selected) return true;
-        const source = linkEndpointId(link.source);
-        const target = linkEndpointId(link.target);
-        return source === selected || target === selected;
-      };
-
-      graph
-        .backgroundColor('rgba(0,0,0,0)')
-        .showNavInfo(false)
-        .nodeId('id')
-        .nodeVal((node: PaperNode) => {
-          if (node.id === selectedIdRef.current) return 18;
-          if (node.isSeed) return 13;
-          return node.val;
-        })
-        .nodeResolution(28)
-        .nodeColor((node: PaperNode) => {
-          if (node.failed) return '#ffb4b4';
-          if (node.id === selectedIdRef.current) return '#ffffff';
-          if (node.isSeed) return '#d6ddff';
-          return isNodeFocused(node) ? '#aebee8' : '#293041';
-        })
-        .nodeOpacity((node: PaperNode) => (isNodeFocused(node) ? 0.98 : 0.14))
-        .nodeLabel((node: PaperNode) => {
-          const authors = node.authors.length ? node.authors.slice(0, 3).join(', ') : 'Unknown authors';
-          const date = node.year ? ` (${node.year})` : '';
-          return `${node.title}${date}<br/><span style="opacity:.65">${authors}</span>`;
-        })
-        .linkColor((link: PaperLink) => (isLinkFocused(link) ? '#c7d1ff' : '#1a1d29'))
-        .linkOpacity((link: PaperLink) => (isLinkFocused(link) ? 0.52 : 0.055))
-        .linkWidth((link: PaperLink) => (isLinkFocused(link) ? 0.9 : 0.18))
-        .linkDirectionalParticles((link: PaperLink) => (isLinkFocused(link) ? 1 : 0))
-        .linkDirectionalParticleWidth(1.4)
-        .linkDirectionalParticleSpeed(0.0032)
-        .enableNodeDrag(true)
-        .onNodeClick((node: PaperNode) => selectNodeRef.current(node))
-        .onBackgroundClick(() => setSelectedId(null))
-        .graphData(graphDataRef.current);
-
-      graph.d3Force('charge')?.strength(-135);
-      graph.d3Force('link')?.distance(92);
-      graph.d3Force('center')?.strength?.(0.08);
-
-      const scene = graph.scene?.();
-      if (scene) {
-        const three = await import('three');
-        scene.fog = new three.FogExp2(0x050507, 0.0028);
-      }
-
-      const resize = () => {
-        if (!graphElRef.current || !graphInstanceRef.current) return;
-        graphInstanceRef.current.width(graphElRef.current.clientWidth).height(graphElRef.current.clientHeight);
-      };
-
-      resize();
-      window.addEventListener('resize', resize);
-      removeResizeListener = () => window.removeEventListener('resize', resize);
-    }
-
-    void initializeGraph();
-
-    return () => {
-      destroyed = true;
-      removeResizeListener?.();
-      if (graphInstanceRef.current?._destructor) {
-        graphInstanceRef.current._destructor();
-      }
-      graphInstanceRef.current = null;
-    };
-  }, []);
-
-  useEffect(() => {
-    const graph = graphInstanceRef.current;
-    if (!graph) return;
-
-    graph.graphData(graphData);
-    graph.refresh?.();
-
-    if (graphData.nodes.length > 1 && !hasFitGraphRef.current) {
-      hasFitGraphRef.current = true;
-      window.setTimeout(() => graph.zoomToFit?.(650, 90), 300);
-    }
-  }, [graphData, selectedId, focusIds]);
+  }, [expandArticle]);
 
   return (
     <main className="research-shell">
-      <div className="graph-canvas" ref={graphElRef} aria-label="Research paper reference graph" />
+      <div className="graph-plane" aria-label="Research paper reference graph">
+        <svg className="graph-links" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
+          <defs>
+            <filter id="soft-glow" x="-50%" y="-50%" width="200%" height="200%">
+              <feGaussianBlur stdDeviation="0.9" result="coloredBlur" />
+              <feMerge>
+                <feMergeNode in="coloredBlur" />
+                <feMergeNode in="SourceGraphic" />
+              </feMerge>
+            </filter>
+          </defs>
+          {visibleLinks.map((link) => (
+            <line
+              key={`${link.source.id}-${link.target.id}`}
+              x1={link.source.px}
+              y1={link.source.py}
+              x2={link.target.px}
+              y2={link.target.py}
+              className={link.focused ? 'graph-link focused' : 'graph-link dimmed'}
+            />
+          ))}
+        </svg>
+
+        <div className="graph-depth-field" />
+
+        {positionedNodes.map((node) => {
+          const isSelected = node.id === selectedId;
+          const size = node.isSeed ? 22 : 16;
+          return (
+            <button
+              key={node.id}
+              className={`graph-node${isSelected ? ' selected' : ''}${node.focused ? ' focused' : ' dimmed'}${node.loading ? ' loading' : ''}`}
+              style={{
+                left: `${node.px}%`,
+                top: `${node.py}%`,
+                width: `${size}px`,
+                height: `${size}px`,
+                transform: `translate(-50%, -50%) scale(${node.scale})`,
+                filter: node.blur ? `blur(${node.blur}px)` : undefined
+              }}
+              title={node.title}
+              onClick={() => selectNode(node)}
+              aria-label={node.title}
+            >
+              <span className="node-core" />
+              <span className="node-halo" />
+              {(isSelected || node.isSeed || node.focused) && (
+                <span className="node-label">{shortTitle(node.title, isSelected ? 58 : 34)}</span>
+              )}
+            </button>
+          );
+        })}
+      </div>
 
       <div className={`focus-blur${selectedId ? ' active' : ''}`} />
       <div className="vignette" />
@@ -445,7 +454,7 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
       </aside>
 
       <section className="hint-card">
-        Click any paper node to focus and load its references. Drag to rotate. Scroll to zoom. Background click clears the focus blur.
+        Click any paper node to focus and load its references. Background click clears the focus blur.
       </section>
     </main>
   );
