@@ -7,7 +7,7 @@ const ForceGraph2D = dynamic(() => import('react-force-graph-2d'), { ssr: false 
 
 const REFERENCE_LIMIT = 5;
 const RENDER_DEGREES = 5;
-const MAX_AUTO_FETCHES_PER_FOCUS = 90;
+const MAX_AUTO_FETCHES_PER_FOCUS = 80;
 
 type PubMedArticle = {
   id: string;
@@ -82,11 +82,10 @@ function linkEndpointId(endpoint: string | PaperNode) {
 }
 
 function shortTitle(title: string, max = 54) {
-  if (title.length <= max) return title;
-  return `${title.slice(0, max - 1).trim()}…`;
+  return title.length <= max ? title : `${title.slice(0, max - 1).trim()}…`;
 }
 
-function getOutgoingReferenceIds(links: Map<string, PaperLink>, pmid: string) {
+function outgoingReferenceIds(links: Map<string, PaperLink>, pmid: string) {
   const ids: string[] = [];
   links.forEach((link) => {
     if (linkEndpointId(link.source) === pmid) ids.push(linkEndpointId(link.target));
@@ -96,8 +95,7 @@ function getOutgoingReferenceIds(links: Map<string, PaperLink>, pmid: string) {
 
 function buildNeighborhood(graphData: GraphData, centerId: string | null) {
   if (!centerId) {
-    const allDepths = new Map(graphData.nodes.map((node) => [node.id, 0]));
-    return { data: graphData, depthById: allDepths };
+    return { data: graphData, depthById: new Map(graphData.nodes.map((node) => [node.id, 0])) };
   }
 
   const nodeById = new Map(graphData.nodes.map((node) => [node.id, node]));
@@ -111,28 +109,23 @@ function buildNeighborhood(graphData: GraphData, centerId: string | null) {
   });
 
   const depthById = new Map<string, number>([[centerId, 0]]);
-  const queue = [{ id: centerId, depth: 0 }];
+  const queue: Array<{ id: string; depth: number }> = [{ id: centerId, depth: 0 }];
 
   while (queue.length > 0) {
     const current = queue.shift();
     if (!current || current.depth >= RENDER_DEGREES) continue;
 
-    const nextIds = (adjacency.get(current.id) || []).slice(0, REFERENCE_LIMIT);
-    nextIds.forEach((nextId) => {
+    (adjacency.get(current.id) || []).slice(0, REFERENCE_LIMIT).forEach((nextId) => {
       if (!nodeById.has(nextId) || depthById.has(nextId)) return;
-      const nextDepth = current.depth + 1;
-      depthById.set(nextId, nextDepth);
-      queue.push({ id: nextId, depth: nextDepth });
+      const depth = current.depth + 1;
+      depthById.set(nextId, depth);
+      queue.push({ id: nextId, depth });
     });
   }
 
   const nodes = graphData.nodes.filter((node) => depthById.has(node.id));
   const visibleIds = new Set(nodes.map((node) => node.id));
-  const links = graphData.links.filter((link) => {
-    const source = linkEndpointId(link.source);
-    const target = linkEndpointId(link.target);
-    return visibleIds.has(source) && visibleIds.has(target);
-  });
+  const links = graphData.links.filter((link) => visibleIds.has(linkEndpointId(link.source)) && visibleIds.has(linkEndpointId(link.target)));
 
   return { data: { nodes, links }, depthById };
 }
@@ -185,8 +178,8 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
     expandedRef.current = new Set();
     loadingRef.current = new Set();
     focusTokenRef.current += 1;
-    setFocusedId(seedPmid);
     focusedIdRef.current = seedPmid;
+    setFocusedId(seedPmid);
     setStatus('Loading seed article');
     setError(null);
     setGraphData({ nodes: [seed], links: [] });
@@ -201,19 +194,15 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
   }, [focusedId]);
 
   const markNodeLoading = useCallback((pmid: string, loading: boolean, failed = false) => {
-    const old = nodesRef.current.get(pmid);
-    if (!old) return;
-    nodesRef.current.set(pmid, { ...old, loading, failed });
+    const current = nodesRef.current.get(pmid);
+    if (!current) return;
+    nodesRef.current.set(pmid, { ...current, loading, failed });
     commitGraph();
   }, [commitGraph]);
 
   const loadArticle = useCallback(async (pmid: string, depth = 0): Promise<string[]> => {
-    if (expandedRef.current.has(pmid)) {
-      return getOutgoingReferenceIds(linksRef.current, pmid);
-    }
-
-    if (loadingRef.current.has(pmid)) {
-      return getOutgoingReferenceIds(linksRef.current, pmid);
+    if (expandedRef.current.has(pmid) || loadingRef.current.has(pmid)) {
+      return outgoingReferenceIds(linksRef.current, pmid);
     }
 
     loadingRef.current.add(pmid);
@@ -264,12 +253,12 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
 
       expandedRef.current.add(pmid);
       commitGraph();
-      return getOutgoingReferenceIds(linksRef.current, pmid);
+      return outgoingReferenceIds(linksRef.current, pmid);
     } catch (fetchError) {
       const message = fetchError instanceof Error ? fetchError.message : 'Unknown loading error';
       setError(message);
       markNodeLoading(pmid, false, true);
-      return getOutgoingReferenceIds(linksRef.current, pmid);
+      return outgoingReferenceIds(linksRef.current, pmid);
     } finally {
       loadingRef.current.delete(pmid);
     }
@@ -299,9 +288,7 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
         queue.push({ id: referenceId, depth: current.depth + 1 });
       });
 
-      setStatus(
-        `Rendering ${Math.min(RENDER_DEGREES, Math.max(1, current.depth + 1))}/5 degrees from PMID ${centerId}`
-      );
+      setStatus(`Rendering ${Math.min(RENDER_DEGREES, current.depth + 1)}/5 degrees from PMID ${centerId}`);
     }
 
     if (token === focusTokenRef.current) {
@@ -320,8 +307,8 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
 
     if (center && graphRef.current && typeof node.x === 'number' && typeof node.y === 'number') {
       graphRef.current.centerAt(node.x, node.y, 650);
-      const currentZoom = graphRef.current.zoom?.() || 1;
-      if (currentZoom < 0.9) graphRef.current.zoom(0.95, 650);
+      const zoom = graphRef.current.zoom?.() || 1;
+      if (zoom < 0.9) graphRef.current.zoom(0.95, 650);
     }
   }, []);
 
@@ -329,25 +316,22 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
     const graph = graphRef.current;
     if (!graph?.screen2GraphCoords) return;
 
-    const centerScreenX = window.innerWidth * 0.44;
-    const centerScreenY = window.innerHeight * 0.5;
-    const center = graph.screen2GraphCoords(centerScreenX, centerScreenY);
-
-    let nearest: PaperNode | null = null;
+    const center = graph.screen2GraphCoords(window.innerWidth * 0.44, window.innerHeight * 0.5);
+    let nearestId: string | null = null;
     let nearestDistance = Number.POSITIVE_INFINITY;
 
     visibleGraph.nodes.forEach((node) => {
       if (typeof node.x !== 'number' || typeof node.y !== 'number') return;
       const distance = Math.hypot(node.x - center.x, node.y - center.y);
       if (distance < nearestDistance) {
-        nearest = node;
+        nearestId = node.id;
         nearestDistance = distance;
       }
     });
 
-    if (nearest && nearest.id !== focusedIdRef.current) {
-      setFocusedId(nearest.id);
-      focusedIdRef.current = nearest.id;
+    if (nearestId && nearestId !== focusedIdRef.current) {
+      setFocusedId(nearestId);
+      focusedIdRef.current = nearestId;
     }
   }, [visibleGraph.nodes]);
 
@@ -361,27 +345,22 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
     const isFocused = node.id === focusedIdRef.current;
     const opacity = isFocused ? 1 : Math.max(0.22, 0.92 - degree * 0.13);
     const radius = isFocused ? 8.4 : Math.max(3.7, 6.2 - degree * 0.35);
+    const x = node.x || 0;
+    const y = node.y || 0;
 
     ctx.save();
     ctx.globalAlpha = opacity;
 
     const glowRadius = radius * (isFocused ? 5.2 : 3.3);
-    const glow = ctx.createRadialGradient(node.x || 0, node.y || 0, radius * 0.2, node.x || 0, node.y || 0, glowRadius);
+    const glow = ctx.createRadialGradient(x, y, radius * 0.2, x, y, glowRadius);
     glow.addColorStop(0, isFocused ? 'rgba(255,255,255,0.38)' : 'rgba(200,212,255,0.24)');
     glow.addColorStop(1, 'rgba(200,212,255,0)');
     ctx.fillStyle = glow;
     ctx.beginPath();
-    ctx.arc(node.x || 0, node.y || 0, glowRadius, 0, Math.PI * 2);
+    ctx.arc(x, y, glowRadius, 0, Math.PI * 2);
     ctx.fill();
 
-    const nodeGradient = ctx.createRadialGradient(
-      (node.x || 0) - radius * 0.28,
-      (node.y || 0) - radius * 0.32,
-      radius * 0.2,
-      node.x || 0,
-      node.y || 0,
-      radius
-    );
+    const nodeGradient = ctx.createRadialGradient(x - radius * 0.28, y - radius * 0.32, radius * 0.2, x, y, radius);
     nodeGradient.addColorStop(0, node.failed ? '#ffd2d2' : '#ffffff');
     nodeGradient.addColorStop(0.45, node.failed ? '#ffaaaa' : '#cfd8ff');
     nodeGradient.addColorStop(1, node.failed ? '#bc6060' : '#6f83c9');
@@ -390,7 +369,7 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
     ctx.strokeStyle = isFocused ? 'rgba(255,255,255,0.86)' : 'rgba(255,255,255,0.42)';
     ctx.lineWidth = isFocused ? 1.5 / globalScale : 0.8 / globalScale;
     ctx.beginPath();
-    ctx.arc(node.x || 0, node.y || 0, radius, 0, Math.PI * 2);
+    ctx.arc(x, y, radius, 0, Math.PI * 2);
     ctx.fill();
     ctx.stroke();
 
@@ -398,18 +377,17 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
       ctx.strokeStyle = 'rgba(255,255,255,0.75)';
       ctx.lineWidth = 1.2 / globalScale;
       ctx.beginPath();
-      ctx.arc(node.x || 0, node.y || 0, radius + 3, 0, Math.PI * 1.35);
+      ctx.arc(x, y, radius + 3, 0, Math.PI * 1.35);
       ctx.stroke();
     }
 
-    const shouldLabel = isFocused || degree <= 1 || globalScale > 1.25;
-    if (shouldLabel) {
+    if (isFocused || degree <= 1 || globalScale > 1.25) {
       const label = shortTitle(node.title, isFocused ? 70 : 42);
       const fontSize = (isFocused ? 13 : 10) / globalScale;
       ctx.font = `${fontSize}px Inter, ui-sans-serif, system-ui`;
-      const textWidth = ctx.measureText(label).width;
-      const x = (node.x || 0) - textWidth / 2;
-      const y = (node.y || 0) + radius + 15 / globalScale;
+      const width = ctx.measureText(label).width;
+      const labelX = x - width / 2;
+      const labelY = y + radius + 15 / globalScale;
       const padX = 7 / globalScale;
       const padY = 4 / globalScale;
 
@@ -417,12 +395,12 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
       ctx.strokeStyle = isFocused ? 'rgba(255,255,255,0.2)' : 'rgba(255,255,255,0.1)';
       ctx.lineWidth = 1 / globalScale;
       ctx.beginPath();
-      ctx.roundRect(x - padX, y - fontSize - padY, textWidth + padX * 2, fontSize + padY * 2, 8 / globalScale);
+      ctx.roundRect(labelX - padX, labelY - fontSize - padY, width + padX * 2, fontSize + padY * 2, 8 / globalScale);
       ctx.fill();
       ctx.stroke();
 
       ctx.fillStyle = isFocused ? 'rgba(247,247,242,0.96)' : 'rgba(247,247,242,0.72)';
-      ctx.fillText(label, x, y - 2 / globalScale);
+      ctx.fillText(label, labelX, labelY - 2 / globalScale);
     }
 
     ctx.restore();
@@ -449,9 +427,8 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
           nodePointerAreaPaint={drawPointerArea}
           linkColor={(link: PaperLink) => {
             const source = linkEndpointId(link.source);
-            const sourceDegree = depthByIdRef.current.get(source) ?? RENDER_DEGREES;
-            const alpha = Math.max(0.08, 0.58 - sourceDegree * 0.09);
-            return `rgba(202,213,255,${alpha})`;
+            const degree = depthByIdRef.current.get(source) ?? RENDER_DEGREES;
+            return `rgba(202,213,255,${Math.max(0.08, 0.58 - degree * 0.09)})`;
           }}
           linkWidth={(link: PaperLink) => {
             const source = linkEndpointId(link.source);
@@ -533,9 +510,7 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
                   </li>
                 ))
               ) : (
-                <li className="reference-meta">
-                  References are loading automatically for the centered paper.
-                </li>
+                <li className="reference-meta">References are loading automatically for the centered paper.</li>
               )}
             </ul>
           </section>
