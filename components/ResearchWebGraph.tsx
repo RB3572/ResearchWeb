@@ -4,7 +4,6 @@ import dynamic from 'next/dynamic';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import DotField from './DotField';
 import GraphLoader from './GraphLoader';
-import SvgBlobAnimation from './SvgBlobAnimation';
 
 // next/dynamic doesn't forward refs — wrap the import so the graph handle
 // (zoomToFit, centerAt, d3Force) actually reaches us via the `fgRef` prop.
@@ -212,15 +211,29 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
     }, 680);
   }, []);
 
-  // Freeze every node except one at its current position. Used when a drag
-  // starts so the surrounding web can't react/vibrate — only the dragged node
-  // moves, and its links stretch smoothly to fixed neighbours.
-  const freezeAllExcept = useCallback((except: GraphNode | null) => {
+  // Pin every node at its current position (dead‑calm at rest).
+  const freezeAll = useCallback(() => {
     nodesRef.current.forEach((node) => {
-      if (node === except) return;
       if (typeof node.x === 'number' && typeof node.y === 'number') {
         node.fx = node.x;
         node.fy = node.y;
+      }
+    });
+  }, []);
+
+  // During a drag, only the dragged node's DIRECT neighbours are free to follow
+  // it — the rest of the (dense) web stays pinned so it can't shimmer. This keeps
+  // the drag feeling connected without the whole simulation vibrating.
+  const freezeExceptNeighbors = useCallback((node: GraphNode) => {
+    const neighbours = neighborsRef.current.get(node.id);
+    nodesRef.current.forEach((other) => {
+      if (other === node) return;
+      if (neighbours && neighbours.has(other.id)) {
+        other.fx = undefined;
+        other.fy = undefined;
+      } else if (typeof other.x === 'number' && typeof other.y === 'number') {
+        other.fx = other.x;
+        other.fy = other.y;
       }
     });
   }, []);
@@ -492,14 +505,14 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
     };
   }, []);
 
-  // Obsidian-style density, but tuned for calm: a soft link spring (low
-  // strength) plus heavy velocity damping means every motion eases in slowly
-  // and never oscillates — nothing snaps or vibrates.
+  // Live Obsidian-style physics tuned for calm: neighbours follow a dragged
+  // node, but the link spring is soft (low strength) so motion glides to rest
+  // without overshooting/oscillating — responsive, never jittery.
   useEffect(() => {
     const graph = graphRef.current;
     if (!graph || graphData.nodes.length === 0) return;
-    graph.d3Force('charge')?.strength(-46).distanceMax(300);
-    graph.d3Force('link')?.distance(32).strength(0.3);
+    graph.d3Force('charge')?.strength(-52).distanceMax(320);
+    graph.d3Force('link')?.distance(32).strength(0.42);
     graph.d3Force('center')?.strength(0.045);
   }, [graphData.nodes.length]);
 
@@ -755,7 +768,6 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
 
   return (
     <main className="shell">
-      <SvgBlobAnimation />
       <DotField theme={theme} />
 
       <div
@@ -780,7 +792,7 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
           linkCanvasObjectMode={() => 'replace'}
           autoPauseRedraw={false}
           d3AlphaDecay={0.025}
-          d3VelocityDecay={0.62}
+          d3VelocityDecay={0.6}
           warmupTicks={0}
           cooldownTime={6000}
           onRenderFramePre={updateCentroid}
@@ -790,20 +802,21 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
           }}
           onNodeClick={(node: GraphNode) => selectArticle(node.id)}
           onNodeDrag={(node: GraphNode) => {
-            // Freeze the whole web the moment a drag begins so nothing around
-            // the dragged node can react or vibrate — only this node moves.
+            // Only direct neighbours follow; the rest of the web is frozen so it
+            // can't shimmer. Soft springs make the local follow-motion glide.
             if (draggingNodeRef.current !== node) {
               draggingNodeRef.current = node;
               userInteractedRef.current = true;
-              freezeAllExcept(node);
+              freezeExceptNeighbors(node);
             }
           }}
           onNodeDragEnd={(node: GraphNode) => {
-            // Leave the node where it was dropped (Obsidian-style) — pinning it
-            // means releasing the drag causes no spring-back or settle motion.
+            // Keep the node where it was dropped, then re-freeze everything so
+            // the graph is completely still until the next interaction.
             node.fx = node.x;
             node.fy = node.y;
             draggingNodeRef.current = null;
+            freezeAll();
           }}
           onBackgroundClick={() => setSelectedId(null)}
           onEngineStop={() => {
@@ -815,7 +828,6 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
       </div>
 
       <div className="edge-blur" aria-hidden="true" />
-      <div className="edge-fade" aria-hidden="true" />
 
       <header className="wordmark">research web</header>
 
