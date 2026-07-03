@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
+import { getPmidByDoi, setArticleDoi } from '@/lib/db';
 
 export const maxDuration = 30;
 
@@ -29,6 +30,16 @@ export async function GET(request: NextRequest) {
   }
 
   try {
+    // Database first: if anyone has ever loaded this DOI, we already know its
+    // PMID — no NCBI round-trip needed.
+    const cachedPmid = await getPmidByDoi(doi).catch(() => null);
+    if (cachedPmid) {
+      return NextResponse.json(
+        { pmid: cachedPmid, doi, cached: true },
+        { headers: { 'Cache-Control': 'public, max-age=0, must-revalidate, s-maxage=86400' } }
+      );
+    }
+
     const url = new URL(`${EUTILS_BASE}/esearch.fcgi`);
     url.searchParams.set('db', 'pubmed');
     url.searchParams.set('term', `"${doi}"[AID]`);
@@ -53,6 +64,9 @@ export async function GET(request: NextRequest) {
         { status: 404 }
       );
     }
+
+    // Cache the mapping so this DOI never needs esearch again.
+    await setArticleDoi(pmid, doi).catch(() => {});
 
     return NextResponse.json(
       { pmid, doi },

@@ -80,8 +80,26 @@ const MONET_RAMP: Array<[number, number, number]> = [
 ];
 
 const CREAM: [number, number, number] = [255, 243, 216];
-const LINK_BASE: [number, number, number] = [190, 160, 130];
-const LINK_HOT: [number, number, number] = [246, 206, 140];
+
+type Theme = 'dark' | 'light';
+
+// Node fills stay Monet in both themes; only the neutral chrome (links, labels,
+// selection ring) flips so it stays legible on a black-or-white backdrop.
+const THEME_PALETTE: Record<
+  Theme,
+  { link: [number, number, number]; linkHot: [number, number, number]; label: string }
+> = {
+  dark: {
+    link: [198, 198, 202],
+    linkHot: [240, 238, 230],
+    label: '243, 240, 236'
+  },
+  light: {
+    link: [90, 90, 96],
+    linkHot: [40, 40, 46],
+    label: '26, 26, 30'
+  }
+};
 
 function mix(a: [number, number, number], b: [number, number, number], t: number): [number, number, number] {
   const clamped = Math.max(0, Math.min(1, t));
@@ -120,7 +138,7 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
   const neighborsRef = useRef<Map<string, Set<string>>>(new Map());
   const detailsRef = useRef<Map<string, ArticleResponse>>(new Map());
   const pendingDetailRef = useRef<Map<string, Promise<ArticleResponse | null>>>(new Map());
-  const expandedGraphRef = useRef<Set<string>>(new Set());
+  const expandedDepthRef = useRef<Map<string, number>>(new Map());
   const nodeVisualsRef = useRef<Map<string, NodeVisual>>(new Map());
   const linkVisualsRef = useRef<Map<string, LinkVisual>>(new Map());
   const hoverRef = useRef<string | null>(null);
@@ -131,8 +149,12 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
   const autoTimerRef = useRef<number | null>(null);
   const userInteractedRef = useRef(false);
   const framedRef = useRef(false);
+  // Pinning must wait until the initial layout has spread out, or auto-expand
+  // would freeze the whole web while it's still collapsed near the origin.
+  const seedSettledRef = useRef(false);
   const seedTokenRef = useRef(0);
   const cardDragRef = useRef<{ dx: number; dy: number } | null>(null);
+  const draggingNodeRef = useRef<GraphNode | null>(null);
 
   const [graphData, setGraphData] = useState<{ nodes: GraphNode[]; links: GraphLink[] }>({ nodes: [], links: [] });
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -142,6 +164,11 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
   const [doiValue, setDoiValue] = useState('');
   const [doiBusy, setDoiBusy] = useState(false);
   const [cardPos, setCardPos] = useState<{ x: number; y: number } | null>(null);
+  // Size the canvas explicitly — react-force-graph's auto-sizing occasionally
+  // measures the parent as 0 (e.g. after a viewport change), leaving it blank.
+  const [dims, setDims] = useState({ width: 0, height: 0 });
+  const [theme, setTheme] = useState<Theme>('dark');
+  const themeRef = useRef<Theme>('dark');
 
   const rebuildIndexes = useCallback(() => {
     const degrees = new Map<string, number>();
@@ -185,8 +212,42 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
     }, 680);
   }, []);
 
+  // Freeze every node except one at its current position. Used when a drag
+  // starts so the surrounding web can't react/vibrate — only the dragged node
+  // moves, and its links stretch smoothly to fixed neighbours.
+  const freezeAllExcept = useCallback((except: GraphNode | null) => {
+    nodesRef.current.forEach((node) => {
+      if (node === except) return;
+      if (typeof node.x === 'number' && typeof node.y === 'number') {
+        node.fx = node.x;
+        node.fy = node.y;
+      }
+    });
+  }, []);
+
   const mergeGraph = useCallback(
-    (data: GraphResponse, origin?: GraphNode) => {
+    (data: GraphResponse, origin?: GraphNode, stabilize = false) => {
+      // Adding nodes reheats d3's simulation to full alpha, which otherwise
+      // yanks the whole layout around. Pin the existing nodes at their current
+      // positions so only the newcomers move — the web *grows* instead of
+      // reshuffling. Pins are released a couple seconds after growth stops.
+      // Skip while a drag is active, or before the seed layout has spread —
+      // pinning too early would lock the web into its collapsed initial state.
+      const shouldPin = stabilize && !draggingNodeRef.current && seedSettledRef.current;
+      if (shouldPin) {
+        nodesRef.current.forEach((node) => {
+          if (typeof node.x === 'number' && typeof node.y === 'number') {
+            node.fx = node.x;
+            node.fy = node.y;
+          }
+        });
+      }
+
+      // With a parent, newcomers emerge right beside it and ease out along
+      // their links. For a bulk/seed load (no parent) pre-spread them across a
+      // wide disk so the layout starts open instead of exploding from a point.
+      const bulkRadius = origin ? 0 : Math.max(180, Math.sqrt(data.nodes.length) * 12);
+
       data.nodes.forEach((incoming) => {
         const existing = nodesRef.current.get(incoming.pmid);
         if (existing) {
@@ -197,12 +258,14 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
           existing.expanded = existing.expanded || incoming.expanded;
         } else {
           const angle = Math.random() * Math.PI * 2;
-          const distance = 18 + Math.random() * 40;
+          const distance = origin ? 10 + Math.random() * 22 : Math.sqrt(Math.random()) * bulkRadius;
           nodesRef.current.set(incoming.pmid, {
             ...incoming,
             id: incoming.pmid,
             x: (origin?.x ?? 0) + Math.cos(angle) * distance,
-            y: (origin?.y ?? 0) + Math.sin(angle) * distance
+            y: (origin?.y ?? 0) + Math.sin(angle) * distance,
+            vx: 0,
+            vy: 0
           } as GraphNode);
         }
       });
@@ -215,6 +278,8 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
       });
 
       commitGraph();
+      // Pins persist so additions never disturb the existing layout — the web
+      // only ever grows. A drag releases them for physics (see onNodeDrag).
     },
     [commitGraph]
   );
@@ -251,17 +316,22 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
     return request;
   }, []);
 
+  // Returns true only if it actually pulled in a deeper neighbourhood than
+  // whatever depth this node was already expanded to.
   const expandGraphFrom = useCallback(
-    async (pmid: string, depth = 2, cap = 24) => {
-      if (expandedGraphRef.current.has(pmid)) return;
-      expandedGraphRef.current.add(pmid);
+    async (pmid: string, depth = 2, cap = 24): Promise<boolean> => {
+      const done = expandedDepthRef.current.get(pmid) ?? 0;
+      if (done >= depth) return false;
+      expandedDepthRef.current.set(pmid, depth);
       try {
         const data = await fetchGraph(pmid, depth, cap);
-        mergeGraph(data, nodesRef.current.get(pmid));
+        mergeGraph(data, nodesRef.current.get(pmid), true);
         const node = nodesRef.current.get(pmid);
         if (node) node.expanded = true;
+        return true;
       } catch {
-        expandedGraphRef.current.delete(pmid);
+        expandedDepthRef.current.set(pmid, done);
+        return false;
       }
     },
     [fetchGraph, mergeGraph]
@@ -282,9 +352,9 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
       }
       const next = autoQueueRef.current.shift();
       if (!next) return;
-      if (!expandedGraphRef.current.has(next)) {
+      const grew = await expandGraphFrom(next, 1, 8);
+      if (grew) {
         autoCountRef.current += 1;
-        await expandGraphFrom(next, 1, 8);
         // Keep it centered while filling; don't re-zoom once framed.
         if (token === seedTokenRef.current && !userInteractedRef.current && !framedRef.current) {
           graphRef.current?.zoomToFit(700, 40);
@@ -308,21 +378,24 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
       selectedRef.current = null;
       setSelectedDetail(null);
 
+      draggingNodeRef.current = null;
       nodesRef.current = new Map();
       linksRef.current = new Map();
-      expandedGraphRef.current = new Set();
+      expandedDepthRef.current = new Map();
       nodeVisualsRef.current = new Map();
       linkVisualsRef.current = new Map();
       autoQueueRef.current = [];
       autoCountRef.current = 0;
       userInteractedRef.current = false;
       framedRef.current = false;
+      seedSettledRef.current = false;
       setGraphData({ nodes: [], links: [] });
 
       try {
+        // Main page: the seed's 4-degree neighbourhood (pre-crawled in Neon).
         const data = await fetchGraph(pmid, 4);
         if (token !== seedTokenRef.current) return;
-        expandedGraphRef.current.add(pmid);
+        expandedDepthRef.current.set(pmid, 4);
         mergeGraph(data);
 
         // Queue un-expanded stubs (closest first) for gentle background growth.
@@ -341,6 +414,11 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
             }
           }, wait);
         });
+        // The layout has spread by now — from here, additions pin the existing
+        // web in place so it grows smoothly instead of reshuffling.
+        window.setTimeout(() => {
+          if (token === seedTokenRef.current) seedSettledRef.current = true;
+        }, 4200);
         window.setTimeout(() => {
           if (token === seedTokenRef.current && !userInteractedRef.current) {
             framedRef.current = true;
@@ -376,13 +454,53 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
     return () => window.clearTimeout(timer);
   }, [error]);
 
-  // Obsidian-style density: short links, gentle repulsion.
+  useEffect(() => {
+    const update = () => setDims({ width: window.innerWidth, height: window.innerHeight });
+    update();
+    window.addEventListener('resize', update);
+    return () => window.removeEventListener('resize', update);
+  }, []);
+
+  // Restore the saved theme (or follow the OS preference) once on mount.
+  useEffect(() => {
+    const saved = window.localStorage.getItem('rw-theme') as Theme | null;
+    const initial: Theme = saved || (window.matchMedia?.('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+    setTheme(initial);
+  }, []);
+
+  useEffect(() => {
+    themeRef.current = theme;
+    document.documentElement.dataset.theme = theme;
+    window.localStorage.setItem('rw-theme', theme);
+  }, [theme]);
+
+  // Every visitor pitches in: quietly ask the server to crawl a few un-expanded
+  // articles into Neon. The shared graph grows with traffic and future loads get
+  // faster (already-cached info is never re-fetched). Fire-and-forget.
+  useEffect(() => {
+    let cancelled = false;
+    const contribute = () => {
+      if (cancelled || document.hidden) return;
+      fetch('/api/pubmed/expand?n=2').catch(() => {});
+    };
+    const timers = [6000, 15000, 26000].map((delay) => window.setTimeout(contribute, delay));
+    const interval = window.setInterval(contribute, 45000);
+    return () => {
+      cancelled = true;
+      timers.forEach((timer) => window.clearTimeout(timer));
+      window.clearInterval(interval);
+    };
+  }, []);
+
+  // Obsidian-style density, but tuned for calm: a soft link spring (low
+  // strength) plus heavy velocity damping means every motion eases in slowly
+  // and never oscillates — nothing snaps or vibrates.
   useEffect(() => {
     const graph = graphRef.current;
     if (!graph || graphData.nodes.length === 0) return;
-    graph.d3Force('charge')?.strength(-52).distanceMax(320);
-    graph.d3Force('link')?.distance(30).strength(0.9);
-    graph.d3Force('center')?.strength(0.06);
+    graph.d3Force('charge')?.strength(-46).distanceMax(300);
+    graph.d3Force('link')?.distance(32).strength(0.3);
+    graph.d3Force('center')?.strength(0.045);
   }, [graphData.nodes.length]);
 
   const selectArticle = useCallback(
@@ -393,7 +511,8 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
       void fetchDetail(pmid).then((detail) => {
         if (detail && selectedRef.current === pmid) setSelectedDetail(detail);
       });
-      void expandGraphFrom(pmid, 2, 24);
+      // Grow at least 3 degrees out from whatever the user last selected.
+      void expandGraphFrom(pmid, 3, 40);
 
       const node = nodesRef.current.get(pmid);
       if (node && graphRef.current && typeof node.x === 'number' && typeof node.y === 'number') {
@@ -501,16 +620,12 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
       ctx.fill();
     }
 
+    const palette = THEME_PALETTE[themeRef.current];
+
     ctx.fillStyle = rgba(color, alpha);
     ctx.beginPath();
     ctx.arc(x, y, radius, 0, Math.PI * 2);
     ctx.fill();
-
-    if (visual.sel > 0.04) {
-      ctx.strokeStyle = rgba(CREAM, 0.9 * visual.sel * alpha);
-      ctx.lineWidth = 1.3 / globalScale;
-      ctx.stroke();
-    }
 
     if (visual.la > 0.03) {
       const emphasis = Math.max(visual.hl, visual.sel);
@@ -520,7 +635,7 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
       ctx.font = `${emphasis > 0.5 ? 500 : 400} ${fontSize}px ui-sans-serif, system-ui, -apple-system, sans-serif`;
       ctx.textAlign = 'center';
       ctx.textBaseline = 'top';
-      ctx.fillStyle = `rgba(243, 234, 216, ${(0.45 + emphasis * 0.5) * visual.la * alpha})`;
+      ctx.fillStyle = `rgba(${palette.label}, ${(0.45 + emphasis * 0.5) * visual.la * alpha})`;
       ctx.fillText(label, x, y + radius + 4 / globalScale);
     }
 
@@ -575,7 +690,8 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
     visual.w = lerp(visual.w, targetWidth, EASE);
     visual.h = lerp(visual.h, targetHeat, EASE);
 
-    ctx.strokeStyle = rgba(mix(LINK_BASE, LINK_HOT, visual.h), visual.a);
+    const palette = THEME_PALETTE[themeRef.current];
+    ctx.strokeStyle = rgba(mix(palette.link, palette.linkHot, visual.h), visual.a);
     ctx.lineWidth = visual.w;
     ctx.beginPath();
     ctx.moveTo(source.x || 0, source.y || 0);
@@ -640,7 +756,7 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
   return (
     <main className="shell">
       <SvgBlobAnimation />
-      <DotField />
+      <DotField theme={theme} />
 
       <div
         className="graph-layer"
@@ -653,6 +769,8 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
       >
         <ForceGraph2D
           fgRef={graphRef}
+          width={dims.width || undefined}
+          height={dims.height || undefined}
           graphData={graphData}
           backgroundColor="rgba(0,0,0,0)"
           nodeId="id"
@@ -661,8 +779,8 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
           linkCanvasObject={drawLink}
           linkCanvasObjectMode={() => 'replace'}
           autoPauseRedraw={false}
-          d3AlphaDecay={0.02}
-          d3VelocityDecay={0.32}
+          d3AlphaDecay={0.025}
+          d3VelocityDecay={0.62}
           warmupTicks={0}
           cooldownTime={6000}
           onRenderFramePre={updateCentroid}
@@ -671,9 +789,21 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
             document.body.style.cursor = node ? 'pointer' : '';
           }}
           onNodeClick={(node: GraphNode) => selectArticle(node.id)}
+          onNodeDrag={(node: GraphNode) => {
+            // Freeze the whole web the moment a drag begins so nothing around
+            // the dragged node can react or vibrate — only this node moves.
+            if (draggingNodeRef.current !== node) {
+              draggingNodeRef.current = node;
+              userInteractedRef.current = true;
+              freezeAllExcept(node);
+            }
+          }}
           onNodeDragEnd={(node: GraphNode) => {
-            node.fx = undefined;
-            node.fy = undefined;
+            // Leave the node where it was dropped (Obsidian-style) — pinning it
+            // means releasing the drag causes no spring-back or settle motion.
+            node.fx = node.x;
+            node.fy = node.y;
+            draggingNodeRef.current = null;
           }}
           onBackgroundClick={() => setSelectedId(null)}
           onEngineStop={() => {
@@ -688,6 +818,27 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
       <div className="edge-fade" aria-hidden="true" />
 
       <header className="wordmark">research web</header>
+
+      <button
+        className="theme-toggle"
+        onClick={() => setTheme((current) => (current === 'dark' ? 'light' : 'dark'))}
+        aria-label={theme === 'dark' ? 'Switch to light mode' : 'Switch to dark mode'}
+        title={theme === 'dark' ? 'Light mode' : 'Dark mode'}
+      >
+        {theme === 'dark' ? (
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" aria-hidden="true">
+            <circle cx="12" cy="12" r="4" />
+            <path
+              strokeLinecap="round"
+              d="M12 3v2m0 14v2M3 12h2m14 0h2M5.6 5.6l1.4 1.4m10 10 1.4 1.4m0-12.8-1.4 1.4m-10 10-1.4 1.4"
+            />
+          </svg>
+        ) : (
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" aria-hidden="true">
+            <path strokeLinecap="round" strokeLinejoin="round" d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z" />
+          </svg>
+        )}
+      </button>
 
       {error ? <div className="error-toast">{error}</div> : null}
 

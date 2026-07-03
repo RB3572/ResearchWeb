@@ -8,14 +8,27 @@ const INFLUENCE = 130;
 const PUSH = 26;
 const EASE = 0.12;
 
+// Neutral greys per theme (no colour) — dark dots on black, darker on white.
+const DOT_RGB: Record<'dark' | 'light', string> = {
+  dark: '178, 178, 183',
+  light: '70, 70, 76'
+};
+
 type Dot = { hx: number; hy: number; x: number; y: number };
+
+type DotFieldProps = { theme: 'dark' | 'light' };
 
 /**
  * A faint grey grid of dots behind the graph that gently parts around the
  * cursor and eases back — a soft, living backdrop rather than a flat void.
  */
-export default function DotField() {
+export default function DotField({ theme }: DotFieldProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const themeRef = useRef(theme);
+
+  useEffect(() => {
+    themeRef.current = theme;
+  }, [theme]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -79,7 +92,7 @@ export default function DotField() {
         const alpha = Math.max(0.06, 0.15 + twinkle + glow * 0.5);
         ctx.beginPath();
         ctx.arc(dot.x, dot.y, DOT_RADIUS + glow * 0.9, 0, Math.PI * 2);
-        ctx.fillStyle = `rgba(196, 176, 150, ${alpha})`;
+        ctx.fillStyle = `rgba(${DOT_RGB[themeRef.current]}, ${alpha})`;
         ctx.fill();
       }
       frame = requestAnimationFrame(render);

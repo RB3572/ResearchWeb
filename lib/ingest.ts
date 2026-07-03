@@ -40,7 +40,8 @@ export async function ingestNode(pmid: string, includeCitedBy = true): Promise<s
     authors: self?.authors || [],
     abstract,
     refs,
-    citedBy
+    citedBy,
+    doi: self?.doi ?? null
   });
 
   for (const neighborId of neighborIds) {
@@ -50,7 +51,8 @@ export async function ingestNode(pmid: string, includeCitedBy = true): Promise<s
       title: summary?.title || `PMID ${neighborId}`,
       year: summary?.year || '',
       source: summary?.source || '',
-      authors: summary?.authors || []
+      authors: summary?.authors || [],
+      doi: summary?.doi ?? null
     });
   }
 

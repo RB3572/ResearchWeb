@@ -10,6 +10,7 @@ export type StoredArticle = {
   refs: string[];
   citedBy: string[];
   expanded: boolean;
+  doi: string | null;
 };
 
 let cachedSql: ReturnType<typeof neon> | null = null;
@@ -24,7 +25,9 @@ export function getSql() {
   return cachedSql;
 }
 
-export async function ensureSchema(): Promise<void> {
+let schemaReady: Promise<void> | null = null;
+
+async function runEnsureSchema(): Promise<void> {
   const sql = getSql();
   await sql`
     create table if not exists articles (
@@ -37,9 +40,21 @@ export async function ensureSchema(): Promise<void> {
       refs jsonb not null default '[]'::jsonb,
       cited_by jsonb not null default '[]'::jsonb,
       expanded boolean not null default false,
+      doi text,
       updated_at timestamptz not null default now()
     )
   `;
+  // Additive migrations for tables created before these columns existed.
+  await sql`alter table articles add column if not exists doi text`;
+  // Speeds up frontier sampling (un-expanded rows) and DOI lookups.
+  await sql`create index if not exists articles_unexpanded_idx on articles (expanded) where not expanded`;
+  await sql`create index if not exists articles_doi_idx on articles (doi) where doi is not null`;
+}
+
+/** Idempotent, memoised so concurrent requests only migrate once per process. */
+export function ensureSchema(): Promise<void> {
+  if (!schemaReady) schemaReady = runEnsureSchema();
+  return schemaReady;
 }
 
 type ArticleRow = {
@@ -52,6 +67,7 @@ type ArticleRow = {
   refs: unknown;
   cited_by: unknown;
   expanded: boolean;
+  doi: string | null;
 };
 
 function asStringArray(value: unknown): string[] {
@@ -68,7 +84,8 @@ function rowToArticle(row: ArticleRow): StoredArticle {
     abstract: row.abstract,
     refs: asStringArray(row.refs),
     citedBy: asStringArray(row.cited_by),
-    expanded: row.expanded
+    expanded: row.expanded,
+    doi: row.doi ?? null
   };
 }
 
@@ -80,7 +97,7 @@ export async function getArticles(pmids: string[]): Promise<Map<string, StoredAr
 
   const sql = getSql();
   const rows = (await sql`
-    select pmid, title, year, source, authors, abstract, refs, cited_by, expanded
+    select pmid, title, year, source, authors, abstract, refs, cited_by, expanded, doi
     from articles
     where pmid = any(${unique}::text[])
   `) as ArticleRow[];
@@ -93,6 +110,53 @@ export async function getArticles(pmids: string[]): Promise<Map<string, StoredAr
 }
 
 /**
+ * Samples un-expanded "frontier" PMIDs — nodes we know about (a neighbour was
+ * stored) but haven't crawled yet. Random sampling spreads the work so many
+ * simultaneous visitors expand different parts of the graph.
+ */
+export async function getUnexpandedFrontier(limit: number): Promise<string[]> {
+  await ensureSchema();
+  const sql = getSql();
+  const rows = (await sql`
+    select pmid from articles
+    where not expanded
+    order by random()
+    limit ${limit}
+  `) as Array<{ pmid: string }>;
+  return rows.map((row) => row.pmid);
+}
+
+/** Records a DOI → PMID mapping so future look-ups skip NCBI's esearch. */
+export async function setArticleDoi(pmid: string, doi: string): Promise<void> {
+  await ensureSchema();
+  const sql = getSql();
+  await sql`
+    insert into articles (pmid, doi) values (${pmid}, ${doi})
+    on conflict (pmid) do update set doi = coalesce(articles.doi, excluded.doi)
+  `;
+}
+
+/** Cached DOI → PMID lookup so a repeated DOI never re-hits NCBI's esearch. */
+export async function getPmidByDoi(doi: string): Promise<string | null> {
+  await ensureSchema();
+  const sql = getSql();
+  const rows = (await sql`
+    select pmid from articles where lower(doi) = lower(${doi}) limit 1
+  `) as Array<{ pmid: string }>;
+  return rows[0]?.pmid ?? null;
+}
+
+/** Totals for the "you're helping grow the shared graph" stat. */
+export async function getStats(): Promise<{ total: number; expanded: number }> {
+  await ensureSchema();
+  const sql = getSql();
+  const rows = (await sql`
+    select count(*)::int as total, count(*) filter (where expanded)::int as expanded from articles
+  `) as Array<{ total: number; expanded: number }>;
+  return { total: rows[0]?.total ?? 0, expanded: rows[0]?.expanded ?? 0 };
+}
+
+/**
  * Inserts a light-weight neighbour row (title/year only) without clobbering a
  * fully-expanded row that may already exist.
  */
@@ -102,16 +166,18 @@ export async function upsertStub(article: {
   year: string;
   source: string;
   authors: string[];
+  doi?: string | null;
 }): Promise<void> {
   const sql = getSql();
   await sql`
-    insert into articles (pmid, title, year, source, authors)
-    values (${article.pmid}, ${article.title}, ${article.year}, ${article.source}, ${JSON.stringify(article.authors)}::jsonb)
+    insert into articles (pmid, title, year, source, authors, doi)
+    values (${article.pmid}, ${article.title}, ${article.year}, ${article.source}, ${JSON.stringify(article.authors)}::jsonb, ${article.doi ?? null})
     on conflict (pmid) do update set
       title = case when articles.title = '' or articles.title like 'PMID %' then excluded.title else articles.title end,
       year = case when articles.year = '' then excluded.year else articles.year end,
       source = case when articles.source = '' then excluded.source else articles.source end,
       authors = case when articles.authors = '[]'::jsonb then excluded.authors else articles.authors end,
+      doi = coalesce(articles.doi, excluded.doi),
       updated_at = now()
   `;
 }
@@ -126,15 +192,16 @@ export async function upsertArticle(article: {
   abstract: string;
   refs: string[];
   citedBy: string[];
+  doi?: string | null;
 }): Promise<void> {
   const sql = getSql();
   await sql`
-    insert into articles (pmid, title, year, source, authors, abstract, refs, cited_by, expanded, updated_at)
+    insert into articles (pmid, title, year, source, authors, abstract, refs, cited_by, doi, expanded, updated_at)
     values (
       ${article.pmid}, ${article.title}, ${article.year}, ${article.source},
       ${JSON.stringify(article.authors)}::jsonb, ${article.abstract},
       ${JSON.stringify(article.refs)}::jsonb, ${JSON.stringify(article.citedBy)}::jsonb,
-      true, now()
+      ${article.doi ?? null}, true, now()
     )
     on conflict (pmid) do update set
       title = excluded.title,
@@ -144,6 +211,7 @@ export async function upsertArticle(article: {
       abstract = excluded.abstract,
       refs = excluded.refs,
       cited_by = excluded.cited_by,
+      doi = coalesce(excluded.doi, articles.doi),
       expanded = true,
       updated_at = now()
   `;

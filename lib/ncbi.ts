@@ -7,9 +7,12 @@ export type PubMedSummary = {
   authors: string[];
   source: string;
   year: string;
+  doi: string | null;
 };
 
 type ESummaryAuthor = { name?: string };
+
+type ESummaryArticleId = { idtype?: string; value?: string };
 
 type ESummaryRecord = {
   uid?: string;
@@ -19,6 +22,8 @@ type ESummaryRecord = {
   source?: string;
   pubdate?: string;
   epubdate?: string;
+  elocationid?: string;
+  articleids?: ESummaryArticleId[];
 };
 
 type ESummaryResponse = {
@@ -100,6 +105,13 @@ async function fetchJson<T>(path: string, params: Record<string, string>): Promi
   return response.json() as Promise<T>;
 }
 
+function extractDoi(record: ESummaryRecord | undefined): string | null {
+  const fromIds = record?.articleids?.find((articleId) => articleId.idtype === 'doi')?.value;
+  if (fromIds) return fromIds.trim().toLowerCase();
+  const fromEloc = record?.elocationid?.match(/10\.\S+\/\S+/)?.[0];
+  return fromEloc ? fromEloc.trim().toLowerCase() : null;
+}
+
 function normalizeSummary(id: string, record: ESummaryRecord | undefined): PubMedSummary {
   const pubdate = record?.pubdate || record?.epubdate || '';
   return {
@@ -111,7 +123,8 @@ function normalizeSummary(id: string, record: ESummaryRecord | undefined): PubMe
       .filter((name): name is string => Boolean(name))
       .slice(0, 6),
     source: record?.fulljournalname || record?.source || '',
-    year: pubdate.match(/\d{4}/)?.[0] || ''
+    year: pubdate.match(/\d{4}/)?.[0] || '',
+    doi: extractDoi(record)
   };
 }
 
