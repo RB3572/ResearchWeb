@@ -25,6 +25,9 @@ type PaperNode = PubMedArticle & {
   loading?: boolean;
   failed?: boolean;
   val: number;
+  x?: number;
+  y?: number;
+  z?: number;
 };
 
 type PaperLink = {
