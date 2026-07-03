@@ -182,14 +182,19 @@ export async function upsertStub(article: {
   `;
 }
 
-/** Writes a fully-resolved article (metadata + neighbours + abstract) and marks it expanded. */
+/**
+ * Writes a fully-resolved article (metadata + neighbours) and marks it expanded.
+ * `abstract` may be null — used by the fast neighbourhood build, which skips
+ * abstracts (they're fetched lazily on click). A null abstract never clobbers an
+ * abstract already stored.
+ */
 export async function upsertArticle(article: {
   pmid: string;
   title: string;
   year: string;
   source: string;
   authors: string[];
-  abstract: string;
+  abstract: string | null;
   refs: string[];
   citedBy: string[];
   doi?: string | null;
@@ -208,11 +213,88 @@ export async function upsertArticle(article: {
       year = excluded.year,
       source = excluded.source,
       authors = excluded.authors,
-      abstract = excluded.abstract,
+      abstract = coalesce(excluded.abstract, articles.abstract),
       refs = excluded.refs,
       cited_by = excluded.cited_by,
       doi = coalesce(excluded.doi, articles.doi),
       expanded = true,
+      updated_at = now()
+  `;
+}
+
+/**
+ * Bulk-upsert expanded articles (metadata + links, no abstract) in ONE round
+ * trip via jsonb_to_recordset. Hundreds of sequential writes would otherwise
+ * dominate a neighbourhood build. Caller must dedupe pmids within the batch.
+ */
+export async function bulkUpsertArticles(
+  rows: Array<{
+    pmid: string;
+    title: string;
+    year: string;
+    source: string;
+    authors: string[];
+    refs: string[];
+    citedBy: string[];
+    doi?: string | null;
+  }>
+): Promise<void> {
+  if (rows.length === 0) return;
+  const sql = getSql();
+  const payload = rows.map((r) => ({
+    pmid: r.pmid,
+    title: r.title,
+    year: r.year,
+    source: r.source,
+    authors: r.authors,
+    refs: r.refs,
+    cited_by: r.citedBy,
+    doi: r.doi ?? null
+  }));
+  await sql`
+    insert into articles (pmid, title, year, source, authors, abstract, refs, cited_by, doi, expanded, updated_at)
+    select x.pmid, x.title, x.year, x.source, x.authors, null, x.refs, x.cited_by, x.doi, true, now()
+    from jsonb_to_recordset(${JSON.stringify(payload)}::jsonb)
+      as x(pmid text, title text, year text, source text, authors jsonb, refs jsonb, cited_by jsonb, doi text)
+    on conflict (pmid) do update set
+      title = excluded.title,
+      year = excluded.year,
+      source = excluded.source,
+      authors = excluded.authors,
+      abstract = coalesce(excluded.abstract, articles.abstract),
+      refs = excluded.refs,
+      cited_by = excluded.cited_by,
+      doi = coalesce(excluded.doi, articles.doi),
+      expanded = true,
+      updated_at = now()
+  `;
+}
+
+/** Bulk-upsert neighbour stubs (title only) in one round trip. */
+export async function bulkUpsertStubs(
+  rows: Array<{ pmid: string; title: string; year: string; source: string; authors: string[]; doi?: string | null }>
+): Promise<void> {
+  if (rows.length === 0) return;
+  const sql = getSql();
+  const payload = rows.map((r) => ({
+    pmid: r.pmid,
+    title: r.title,
+    year: r.year,
+    source: r.source,
+    authors: r.authors,
+    doi: r.doi ?? null
+  }));
+  await sql`
+    insert into articles (pmid, title, year, source, authors, doi)
+    select x.pmid, x.title, x.year, x.source, coalesce(x.authors, '[]'::jsonb), x.doi
+    from jsonb_to_recordset(${JSON.stringify(payload)}::jsonb)
+      as x(pmid text, title text, year text, source text, authors jsonb, doi text)
+    on conflict (pmid) do update set
+      title = case when articles.title = '' or articles.title like 'PMID %' then excluded.title else articles.title end,
+      year = case when articles.year = '' then excluded.year else articles.year end,
+      source = case when articles.source = '' then excluded.source else articles.source end,
+      authors = case when articles.authors = '[]'::jsonb then excluded.authors else articles.authors end,
+      doi = coalesce(articles.doi, excluded.doi),
       updated_at = now()
   `;
 }

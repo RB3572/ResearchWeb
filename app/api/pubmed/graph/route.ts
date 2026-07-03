@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { cleanPmid, decodeEntities } from '@/lib/ncbi';
 import { getArticles, type StoredArticle } from '@/lib/db';
-import { ingestNode } from '@/lib/ingest';
+import { expandNeighborhood, ingestNode } from '@/lib/ingest';
 
 export const maxDuration = 60;
 
@@ -110,6 +110,10 @@ export async function GET(request: NextRequest) {
   const depth = Math.min(Math.max(Number.isFinite(depthParam) ? depthParam : 3, 1), 4);
   const capParam = Number.parseInt(searchParams.get('cap') || '64', 10);
   const seedLeafCap = Math.min(Math.max(Number.isFinite(capParam) ? capParam : 64, 4), 64);
+  // Seed loads (the home page / a pasted DOI) request depth 4 — build a rich,
+  // saved 2-degree neighbourhood so the web isn't a lonely 30 nodes. Clicks
+  // (depth ≤3) stay light: they only ingest the one node they touched.
+  const build = searchParams.get('build') === '1' || depth >= 4;
 
   if (!pmid) {
     return NextResponse.json({ error: 'A numeric pmid query parameter is required.' }, { status: 400 });
@@ -118,9 +122,11 @@ export async function GET(request: NextRequest) {
   try {
     let seedRow = (await getArticles([pmid])).get(pmid);
 
-    // Lazy first-touch: if the seed was never crawled, ingest a small
-    // neighbourhood on demand so the graph is never empty.
-    if (!seedRow?.expanded) {
+    if (build) {
+      // Fast batched depth-2 build (idempotent — instant once cached in Neon).
+      await expandNeighborhood(pmid);
+    } else if (!seedRow?.expanded) {
+      // Lazy first-touch so a clicked node is never empty.
       await ingestNode(pmid, true);
       seedRow = (await getArticles([pmid])).get(pmid);
     }

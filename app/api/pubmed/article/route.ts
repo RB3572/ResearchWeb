@@ -22,9 +22,12 @@ export async function GET(request: NextRequest) {
   try {
     let article = (await getArticles([pmid])).get(pmid);
 
-    // Expand on demand when a node hasn't been crawled yet (grows the web as
-    // the user explores). Abstracts only exist on expanded rows.
-    if (!article?.expanded) {
+    // A node is "light" until its card is opened: either never crawled, or
+    // brought in by the fast neighbourhood build (which stores links but no
+    // abstract, hence abstract === null, and no citations). On first open, do a
+    // full ingest so the card has an abstract + references + cited-by, then it's
+    // cached in Neon for everyone.
+    if (!article?.expanded || article.abstract === null) {
       await ingestNode(pmid, true);
       article = (await getArticles([pmid])).get(pmid);
     }

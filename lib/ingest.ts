@@ -1,5 +1,12 @@
 import { fetchAbstract, fetchLinksBatch, fetchSummaries } from '@/lib/ncbi';
-import { ensureSchema, getArticles, upsertArticle, upsertStub } from '@/lib/db';
+import {
+  bulkUpsertArticles,
+  bulkUpsertStubs,
+  ensureSchema,
+  getArticles,
+  upsertArticle,
+  upsertStub
+} from '@/lib/db';
 
 // Kept small: NCBI drops connections on large batched elink requests, and old
 // papers have huge citation lists. These caps keep each node's neighbourhood
@@ -7,9 +14,17 @@ import { ensureSchema, getArticles, upsertArticle, upsertStub } from '@/lib/db';
 const REF_CAP = 16;
 const CITE_CAP = 16;
 const MAX_NODES = 400;
+// elink drops connections when too many ids are batched — keep chunks small.
+const ELINK_CHUNK = 5;
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function chunk<T>(items: T[], size: number): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
+  return out;
 }
 
 /**
@@ -57,6 +72,87 @@ export async function ingestNode(pmid: string, includeCitedBy = true): Promise<s
   }
 
   return neighborIds;
+}
+
+/**
+ * Fast, structure-only expansion of a seed's neighbourhood to depth 2. Unlike
+ * `crawl`, this batches elink/esummary across many nodes and SKIPS abstracts
+ * (fetched lazily on click) — so a fresh DOI produces a rich, saved web in a
+ * handful of requests instead of one-slow-node-at-a-time. Idempotent: neighbours
+ * already expanded are left untouched. Returns the number of nodes expanded.
+ */
+export async function expandNeighborhood(seed: string, maxNeighbors = 26): Promise<number> {
+  await ensureSchema();
+
+  // Make sure the seed itself is expanded (full ingest, with abstract).
+  let seedRow = (await getArticles([seed])).get(seed);
+  if (!seedRow?.expanded) {
+    await ingestNode(seed, true);
+    seedRow = (await getArticles([seed])).get(seed);
+  }
+  if (!seedRow) return 0;
+
+  const neighbours = Array.from(new Set([...seedRow.refs, ...seedRow.citedBy])).slice(0, maxNeighbors);
+  const existing = await getArticles(neighbours);
+  const toExpand = neighbours.filter((id) => !existing.get(id)?.expanded);
+  if (toExpand.length === 0) return 0;
+
+  // References only for the neighbours (citations of old papers can be thousands
+  // of ids — huge payloads that stall the build). Chunked so elink stays happy.
+  const refsMap = new Map<string, string[]>();
+  for (const ids of chunk(toExpand, ELINK_CHUNK)) {
+    const refs = await fetchLinksBatch(ids, 'pubmed_pubmed_refs');
+    refs.forEach((value, key) => refsMap.set(key, value));
+    await delay(process.env.NCBI_API_KEY ? 60 : 180);
+  }
+
+  // Collect every id we'll need a title for (the neighbours + their references).
+  const perNode = new Map<string, string[]>();
+  const allIds = new Set<string>(toExpand);
+  for (const id of toExpand) {
+    const refs = (refsMap.get(id) || []).filter((x) => x !== id).slice(0, REF_CAP);
+    perNode.set(id, refs);
+    refs.forEach((x) => allIds.add(x));
+  }
+
+  const summaries = await fetchSummaries(Array.from(allIds));
+  const expandedSet = new Set(toExpand);
+
+  // Two bulk writes instead of hundreds of round trips: neighbours become
+  // EXPANDED rows (links, no abstract yet); their references become stubs.
+  await bulkUpsertArticles(
+    toExpand.map((id) => {
+      const self = summaries.get(id);
+      return {
+        pmid: id,
+        title: self?.title || `PMID ${id}`,
+        year: self?.year || '',
+        source: self?.source || '',
+        authors: self?.authors || [],
+        refs: perNode.get(id) || [],
+        citedBy: [],
+        doi: self?.doi ?? null
+      };
+    })
+  );
+
+  await bulkUpsertStubs(
+    Array.from(allIds)
+      .filter((id) => !expandedSet.has(id))
+      .map((id) => {
+        const summary = summaries.get(id);
+        return {
+          pmid: id,
+          title: summary?.title || `PMID ${id}`,
+          year: summary?.year || '',
+          source: summary?.source || '',
+          authors: summary?.authors || [],
+          doi: summary?.doi ?? null
+        };
+      })
+  );
+
+  return toExpand.length;
 }
 
 export type CrawlProgress = (message: string) => void;

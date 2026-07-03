@@ -138,16 +138,28 @@ DOI input, theming, and background contribution.
 
 All endpoints live under `app/api/`.
 
-### `GET /api/pubmed/graph?pmid=<id>&depth=<1..4>&cap=<n>`
+### `GET /api/pubmed/graph?pmid=<id>&depth=<1..4>&cap=<n>&build=<0|1>`
 Builds the neighbourhood graph around `pmid` by walking Neon rows to `depth` levels.
 `cap` limits how many direct neighbours the focal node contributes (deeper levels
 use a smaller fixed cap so the web stays interconnected rather than sprouting rings).
 Returns `{ nodes: [{ id, pmid, title, year, source, depth, expanded }], links: [{ source, target }] }`.
-Lazily ingests the seed if it isn't in the DB yet. Total nodes capped at 650.
+Total nodes capped at 650.
+
+**Seed loads** (the home page and pasted DOIs) request `depth=4`, which triggers a
+fast, batched **depth‑2 neighbourhood build** (`expandNeighborhood`) so a brand‑new
+DOI becomes a rich ~200–300‑node web instead of a lonely ~30. The build uses chunked
+batched `elink` (references only — an old paper's citation list can be thousands of
+ids) + a single batched `esummary`, and writes everything to Neon in **two bulk
+inserts** (`jsonb_to_recordset`) rather than hundreds of round trips — ~16s cold,
+then instant on every future load. It skips abstracts (fetched on click). Clicks use
+`depth≤3` and stay light (one‑node ingest).
 
 ### `GET /api/pubmed/article?pmid=<id>`
 Returns one paper's full detail for the card: `{ article: { …, abstract }, references: [...], citedBy: [...] }`.
-Lazily ingests on a miss. Titles/abstract are entity‑decoded at read time.
+Nodes brought in by the fast build are stored without an abstract or citations; the
+first time a card is opened, the route does a full ingest (abstract + references +
+cited‑by) and caches it in Neon — so it's complete forever after. Titles/abstract are
+entity‑decoded at read time.
 
 ### `GET /api/pubmed/resolve?doi=<doi>`
 Resolves a DOI (or a `doi.org` URL) to a PMID. **Checks Neon first** (`getPmidByDoi`)
