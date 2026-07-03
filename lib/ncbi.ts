@@ -45,12 +45,22 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function decodeEntities(value: string): string {
+function codePointToChar(codePoint: number): string {
+  if (!Number.isFinite(codePoint) || codePoint < 32 || codePoint > 0x10ffff) return ' ';
+  // Map the many unicode space variants (thin space U+2009 etc.) to a plain space.
+  const char = String.fromCodePoint(codePoint);
+  return /\s/u.test(char) || (codePoint >= 0x2000 && codePoint <= 0x200f) ? ' ' : char;
+}
+
+export function decodeEntities(value: string): string {
   return value
+    .replace(/&#x([0-9a-f]+);/gi, (_, hex: string) => codePointToChar(Number.parseInt(hex, 16)))
+    .replace(/&#(\d+);/g, (_, dec: string) => codePointToChar(Number.parseInt(dec, 10)))
     .replace(/&lt;/g, '<')
     .replace(/&gt;/g, '>')
     .replace(/&quot;/g, '"')
-    .replace(/&#39;|&apos;/g, "'")
+    .replace(/&apos;/g, "'")
+    .replace(/&nbsp;|&thinsp;|&ensp;|&emsp;/g, ' ')
     .replace(/&amp;/g, '&')
     .replace(/\s+/g, ' ')
     .trim();

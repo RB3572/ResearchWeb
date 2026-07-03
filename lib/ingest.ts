@@ -79,28 +79,38 @@ export async function crawl(seed: string, depth = 3, onProgress?: CrawlProgress)
 
   for (let level = 0; level < depth; level += 1) {
     const nextFrontier = new Set<string>();
+    // Nodes already expanded in a previous crawl keep their stored neighbours —
+    // reuse them instead of re-hitting NCBI.
+    const storedRows = await getArticles(frontier);
 
     for (const pmid of frontier) {
       if (expanded.has(pmid)) continue;
       if (expanded.size >= MAX_NODES) break;
 
-      try {
-        const neighbors = await ingestNode(pmid, level === 0);
-        expanded.add(pmid);
-        onProgress?.(`[depth ${level}] expanded ${pmid} (+${neighbors.length}) — ${expanded.size} total`);
+      let neighbors: string[] = [];
+      const stored = storedRows.get(pmid);
 
-        for (const neighborId of neighbors) {
-          if (!scheduledDepth.has(neighborId)) {
-            scheduledDepth.set(neighborId, level + 1);
-            if (level + 1 < depth) nextFrontier.add(neighborId);
-          }
+      if (stored?.expanded) {
+        neighbors = Array.from(new Set([...stored.refs, ...stored.citedBy]));
+        expanded.add(pmid);
+      } else {
+        try {
+          neighbors = await ingestNode(pmid, level === 0);
+          expanded.add(pmid);
+          onProgress?.(`[depth ${level}] expanded ${pmid} (+${neighbors.length}) — ${expanded.size} total`);
+        } catch (error) {
+          onProgress?.(`[depth ${level}] failed ${pmid}: ${error instanceof Error ? error.message : 'error'}`);
         }
-      } catch (error) {
-        onProgress?.(`[depth ${level}] failed ${pmid}: ${error instanceof Error ? error.message : 'error'}`);
+        // Throttle to stay under NCBI's request-rate limits.
+        await delay(process.env.NCBI_API_KEY ? 120 : 380);
       }
 
-      // Throttle to stay under NCBI's request-rate limits.
-      await delay(process.env.NCBI_API_KEY ? 120 : 380);
+      for (const neighborId of neighbors) {
+        if (!scheduledDepth.has(neighborId)) {
+          scheduledDepth.set(neighborId, level + 1);
+          if (level + 1 < depth) nextFrontier.add(neighborId);
+        }
+      }
     }
 
     frontier = Array.from(nextFrontier).slice(0, MAX_NODES - expanded.size);

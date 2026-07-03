@@ -52,8 +52,9 @@ export default function DotField() {
       }
     };
 
-    const render = () => {
+    const render = (time: number) => {
       ctx.clearRect(0, 0, width, height);
+      const breathe = time * 0.00045;
       for (let index = 0; index < dots.length; index += 1) {
         const dot = dots[index];
         const dx = dot.x - mouse.x;
@@ -73,7 +74,9 @@ export default function DotField() {
         dot.x += (targetX - dot.x) * EASE;
         dot.y += (targetY - dot.y) * EASE;
 
-        const alpha = 0.16 + glow * 0.5;
+        // Slow per-dot shimmer keeps the field feeling alive even when idle.
+        const twinkle = Math.sin(breathe + dot.hx * 0.021 + dot.hy * 0.017) * 0.05;
+        const alpha = Math.max(0.06, 0.15 + twinkle + glow * 0.5);
         ctx.beginPath();
         ctx.arc(dot.x, dot.y, DOT_RADIUS + glow * 0.9, 0, Math.PI * 2);
         ctx.fillStyle = `rgba(196, 176, 150, ${alpha})`;
@@ -82,7 +85,10 @@ export default function DotField() {
       frame = requestAnimationFrame(render);
     };
 
-    const onMove = (event: MouseEvent) => {
+    // Capture-phase pointermove: d3-drag stops propagation while a node is
+    // being dragged, which starves bubble-phase listeners — capture still
+    // fires, so the field keeps responding mid-drag.
+    const onMove = (event: PointerEvent) => {
       mouse.x = event.clientX;
       mouse.y = event.clientY;
     };
@@ -92,15 +98,19 @@ export default function DotField() {
     };
 
     build();
-    render();
-    window.addEventListener('mousemove', onMove);
-    window.addEventListener('mouseout', onLeave);
+    frame = requestAnimationFrame(render);
+    window.addEventListener('pointermove', onMove, { capture: true, passive: true });
+    window.addEventListener('pointerdown', onMove, { capture: true, passive: true });
+    document.addEventListener('pointerleave', onLeave);
+    window.addEventListener('blur', onLeave);
     window.addEventListener('resize', build);
 
     return () => {
       cancelAnimationFrame(frame);
-      window.removeEventListener('mousemove', onMove);
-      window.removeEventListener('mouseout', onLeave);
+      window.removeEventListener('pointermove', onMove, { capture: true } as EventListenerOptions);
+      window.removeEventListener('pointerdown', onMove, { capture: true } as EventListenerOptions);
+      document.removeEventListener('pointerleave', onLeave);
+      window.removeEventListener('blur', onLeave);
       window.removeEventListener('resize', build);
     };
   }, []);

@@ -1,13 +1,15 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { cleanPmid } from '@/lib/ncbi';
+import { cleanPmid, decodeEntities } from '@/lib/ncbi';
 import { getArticles, type StoredArticle } from '@/lib/db';
 import { ingestNode } from '@/lib/ingest';
 
-const MAX_NODES = 320;
+export const maxDuration = 60;
+
+const MAX_NODES = 650;
 // Cap how many *new* single-link leaves each node introduces so the graph reads
 // as an interconnected web rather than dandelion rings. Cross-links to nodes
 // already in the graph are always kept.
-const NEW_LEAF_CAP = 8;
+const NEW_LEAF_CAP = 11;
 
 type GraphNode = {
   id: string;
@@ -16,13 +18,14 @@ type GraphNode = {
   year: string;
   source: string;
   depth: number;
+  expanded: boolean;
 };
 
 /**
  * Builds the graph by walking stored articles breadth-first from the seed.
  * Pure database reads — fast enough to fill the screen on load.
  */
-async function readGraph(seed: string, depth: number) {
+async function readGraph(seed: string, depth: number, seedLeafCap: number) {
   const depthByPmid = new Map<string, number>([[seed, 0]]);
   const loaded = new Map<string, StoredArticle>();
   const linkKeys = new Set<string>();
@@ -51,13 +54,16 @@ async function readGraph(seed: string, depth: number) {
       if (level >= depth) return; // don't expand beyond requested depth
 
       let newLeaves = 0;
+      // The focal paper may show its whole neighbourhood; deeper nodes are
+      // capped so the web stays interconnected instead of sprouting rings.
+      const leafCap = level === 0 ? seedLeafCap : NEW_LEAF_CAP;
       const consider = (neighborId: string, addLinkFn: () => void) => {
         addLinkFn();
         if (depthByPmid.has(neighborId)) {
           nextFrontier.add(neighborId); // existing node → keep the cross-link, traverse
           return;
         }
-        if (newLeaves >= NEW_LEAF_CAP || depthByPmid.size >= MAX_NODES) return;
+        if (newLeaves >= leafCap || depthByPmid.size >= MAX_NODES) return;
         newLeaves += 1;
         depthByPmid.set(neighborId, level + 1);
         nextFrontier.add(neighborId);
@@ -83,10 +89,11 @@ async function readGraph(seed: string, depth: number) {
     nodes.push({
       id: pmid,
       pmid,
-      title: row.title,
+      title: decodeEntities(row.title),
       year: row.year,
       source: row.source,
-      depth: depthByPmid.get(pmid) ?? 0
+      depth: depthByPmid.get(pmid) ?? 0,
+      expanded: row.expanded
     });
   });
 
@@ -101,6 +108,8 @@ export async function GET(request: NextRequest) {
   const pmid = cleanPmid(searchParams.get('pmid'));
   const depthParam = Number.parseInt(searchParams.get('depth') || '3', 10);
   const depth = Math.min(Math.max(Number.isFinite(depthParam) ? depthParam : 3, 1), 4);
+  const capParam = Number.parseInt(searchParams.get('cap') || '64', 10);
+  const seedLeafCap = Math.min(Math.max(Number.isFinite(capParam) ? capParam : 64, 4), 64);
 
   if (!pmid) {
     return NextResponse.json({ error: 'A numeric pmid query parameter is required.' }, { status: 400 });
@@ -116,9 +125,9 @@ export async function GET(request: NextRequest) {
       seedRow = (await getArticles([pmid])).get(pmid);
     }
 
-    const graph = await readGraph(pmid, depth);
+    const graph = await readGraph(pmid, depth, seedLeafCap);
     return NextResponse.json(graph, {
-      headers: { 'Cache-Control': 's-maxage=3600, stale-while-revalidate=86400' }
+      headers: { 'Cache-Control': 'public, max-age=0, must-revalidate, s-maxage=3600' }
     });
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown graph error';

@@ -1,12 +1,14 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { cleanPmid } from '@/lib/ncbi';
+import { cleanPmid, decodeEntities } from '@/lib/ncbi';
 import { getArticles, type StoredArticle } from '@/lib/db';
 import { ingestNode } from '@/lib/ingest';
+
+export const maxDuration = 60;
 
 type ListItem = { pmid: string; title: string; year: string; source: string };
 
 function toListItem(article: StoredArticle): ListItem {
-  return { pmid: article.pmid, title: article.title, year: article.year, source: article.source };
+  return { pmid: article.pmid, title: decodeEntities(article.title), year: article.year, source: article.source };
 }
 
 export async function GET(request: NextRequest) {
@@ -40,16 +42,23 @@ export async function GET(request: NextRequest) {
       {
         article: {
           pmid: article.pmid,
-          title: article.title,
+          title: decodeEntities(article.title),
           year: article.year,
           source: article.source,
           authors: article.authors,
-          abstract: article.abstract || ''
+          // Decode per paragraph so entity cleanup can't collapse section breaks.
+          abstract: (article.abstract || '')
+            .split('\n\n')
+            .map((paragraph) => decodeEntities(paragraph))
+            .filter(Boolean)
+            .join('\n\n')
         },
         references: collect(article.refs),
         citedBy: collect(article.citedBy)
       },
-      { headers: { 'Cache-Control': 's-maxage=3600, stale-while-revalidate=86400' } }
+      // max-age=0 keeps browsers revalidating (no stale disk-cache replays);
+      // s-maxage still lets the CDN serve cached copies.
+      { headers: { 'Cache-Control': 'public, max-age=0, must-revalidate, s-maxage=3600' } }
     );
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Unknown PubMed fetch error';
