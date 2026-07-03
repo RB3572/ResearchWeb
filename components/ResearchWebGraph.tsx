@@ -1,530 +1,484 @@
 'use client';
 
 import dynamic from 'next/dynamic';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import DotField from './DotField';
 
 const ForceGraph2D = dynamic(() => import('react-force-graph-2d'), { ssr: false }) as any;
 
-const REFERENCE_LIMIT = 5;
-const RENDER_DEGREES = 5;
-const MAX_AUTO_FETCHES_PER_FOCUS = 80;
-
-type PubMedArticle = {
-  id: string;
+type PaperSummary = {
   pmid: string;
   title: string;
-  authors: string[];
-  source: string;
-  pubdate: string;
   year: string;
-  doi?: string;
+  source: string;
 };
 
-type PaperNode = PubMedArticle & {
-  depth: number;
-  isSeed?: boolean;
-  expanded?: boolean;
-  loading?: boolean;
-  failed?: boolean;
-  val: number;
+type ArticleDetail = PaperSummary & {
+  authors: string[];
+  abstract: string;
+};
+
+type ArticleResponse = {
+  article: ArticleDetail;
+  references: PaperSummary[];
+  citedBy: PaperSummary[];
+  error?: string;
+};
+
+type GraphNodeData = PaperSummary & { depth: number };
+
+type GraphResponse = {
+  nodes: GraphNodeData[];
+  links: Array<{ source: string; target: string }>;
+  error?: string;
+};
+
+type GraphNode = GraphNodeData & {
+  id: string;
   x?: number;
   y?: number;
-  vx?: number;
-  vy?: number;
   fx?: number;
   fy?: number;
 };
 
-type PaperLink = {
-  source: string | PaperNode;
-  target: string | PaperNode;
-  type: 'reference';
-};
-
-type GraphData = {
-  nodes: PaperNode[];
-  links: PaperLink[];
-};
-
-type PubMedArticleResponse = {
-  article: PubMedArticle;
-  references: PubMedArticle[];
-  links: Array<{ source: string; target: string; type: 'reference' }>;
-  error?: string;
-};
+type GraphLink = { source: string | GraphNode; target: string | GraphNode };
 
 type ResearchWebGraphProps = {
   seedPmid: string;
 };
 
-function makeSeedNode(seedPmid: string): PaperNode {
-  return {
-    id: seedPmid,
-    pmid: seedPmid,
-    title: `PMID ${seedPmid}`,
-    authors: [],
-    source: 'PubMed',
-    pubdate: '',
-    year: '',
-    depth: 0,
-    isSeed: true,
-    expanded: false,
-    loading: true,
-    failed: false,
-    val: 12,
-    x: 0,
-    y: 0
-  };
+// Monet "San Giorgio Maggiore at Dusk": dusk sun → water reflection.
+const MONET_RAMP: Array<[number, number, number]> = [
+  [255, 214, 138],
+  [246, 158, 79],
+  [227, 118, 78],
+  [201, 91, 96],
+  [140, 92, 148],
+  [72, 112, 152],
+  [32, 78, 112]
+];
+
+function rampColor(t: number, alpha = 1): string {
+  const clamped = Math.max(0, Math.min(1, t));
+  const scaled = clamped * (MONET_RAMP.length - 1);
+  const index = Math.floor(scaled);
+  const frac = scaled - index;
+  const a = MONET_RAMP[index];
+  const b = MONET_RAMP[Math.min(index + 1, MONET_RAMP.length - 1)];
+  const r = Math.round(a[0] + (b[0] - a[0]) * frac);
+  const g = Math.round(a[1] + (b[1] - a[1]) * frac);
+  const bl = Math.round(a[2] + (b[2] - a[2]) * frac);
+  return `rgba(${r}, ${g}, ${bl}, ${alpha})`;
 }
 
-function linkEndpointId(endpoint: string | PaperNode) {
+function endpointId(endpoint: string | GraphNode): string {
   return typeof endpoint === 'string' ? endpoint : endpoint.id;
-}
-
-function shortTitle(title: string, max = 54) {
-  return title.length <= max ? title : `${title.slice(0, max - 1).trim()}…`;
-}
-
-function outgoingReferenceIds(links: Map<string, PaperLink>, pmid: string) {
-  const ids: string[] = [];
-  links.forEach((link) => {
-    if (linkEndpointId(link.source) === pmid) ids.push(linkEndpointId(link.target));
-  });
-  return ids.slice(0, REFERENCE_LIMIT);
-}
-
-function buildNeighborhood(graphData: GraphData, centerId: string | null) {
-  if (!centerId) {
-    return { data: graphData, depthById: new Map(graphData.nodes.map((node) => [node.id, 0])) };
-  }
-
-  const nodeById = new Map(graphData.nodes.map((node) => [node.id, node]));
-  const adjacency = new Map<string, string[]>();
-
-  graphData.links.forEach((link) => {
-    const source = linkEndpointId(link.source);
-    const target = linkEndpointId(link.target);
-    if (!adjacency.has(source)) adjacency.set(source, []);
-    adjacency.get(source)?.push(target);
-  });
-
-  const depthById = new Map<string, number>([[centerId, 0]]);
-  const queue: Array<{ id: string; depth: number }> = [{ id: centerId, depth: 0 }];
-
-  while (queue.length > 0) {
-    const current = queue.shift();
-    if (!current || current.depth >= RENDER_DEGREES) continue;
-
-    (adjacency.get(current.id) || []).slice(0, REFERENCE_LIMIT).forEach((nextId) => {
-      if (!nodeById.has(nextId) || depthById.has(nextId)) return;
-      const depth = current.depth + 1;
-      depthById.set(nextId, depth);
-      queue.push({ id: nextId, depth });
-    });
-  }
-
-  const nodes = graphData.nodes.filter((node) => depthById.has(node.id));
-  const visibleIds = new Set(nodes.map((node) => node.id));
-  const links = graphData.links.filter((link) => visibleIds.has(linkEndpointId(link.source)) && visibleIds.has(linkEndpointId(link.target)));
-
-  return { data: { nodes, links }, depthById };
 }
 
 export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
   const graphRef = useRef<any>(null);
-  const viewportFocusTimerRef = useRef<number | null>(null);
-  const focusTokenRef = useRef(0);
-  const nodesRef = useRef<Map<string, PaperNode>>(new Map([[seedPmid, makeSeedNode(seedPmid)]]));
-  const linksRef = useRef<Map<string, PaperLink>>(new Map());
-  const expandedRef = useRef<Set<string>>(new Set());
-  const loadingRef = useRef<Set<string>>(new Set());
-  const depthByIdRef = useRef<Map<string, number>>(new Map([[seedPmid, 0]]));
-  const focusedIdRef = useRef<string | null>(seedPmid);
+  const nodesRef = useRef<Map<string, GraphNode>>(new Map());
+  const linksRef = useRef<Map<string, GraphLink>>(new Map());
+  const degreeRef = useRef<Map<string, number>>(new Map());
+  const neighborsRef = useRef<Map<string, Set<string>>>(new Map());
+  const detailsRef = useRef<Map<string, ArticleResponse>>(new Map());
+  const pendingDetailRef = useRef<Map<string, Promise<ArticleResponse | null>>>(new Map());
+  const expandedGraphRef = useRef<Set<string>>(new Set());
+  const hoverRef = useRef<string | null>(null);
+  const selectedRef = useRef<string | null>(null);
+  const centerRef = useRef<{ x: number; y: number; maxR: number }>({ x: 0, y: 0, maxR: 1 });
+  const didFitRef = useRef(false);
 
-  const [graphData, setGraphData] = useState<GraphData>(() => ({ nodes: [makeSeedNode(seedPmid)], links: [] }));
-  const [focusedId, setFocusedId] = useState<string | null>(seedPmid);
-  const [status, setStatus] = useState('Loading seed article');
+  const [graphData, setGraphData] = useState<{ nodes: GraphNode[]; links: GraphLink[] }>({ nodes: [], links: [] });
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [selectedDetail, setSelectedDetail] = useState<ArticleResponse | null>(null);
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  const nodeById = useMemo(() => new Map(graphData.nodes.map((node) => [node.id, node])), [graphData.nodes]);
-  const focusedNode = focusedId ? nodeById.get(focusedId) || null : null;
-
-  const selectedReferences = useMemo(() => {
-    if (!focusedId) return [];
-    return graphData.links
-      .filter((link) => linkEndpointId(link.source) === focusedId)
-      .map((link) => nodeById.get(linkEndpointId(link.target)))
-      .filter((node): node is PaperNode => Boolean(node))
-      .slice(0, REFERENCE_LIMIT);
-  }, [focusedId, graphData.links, nodeById]);
-
-  const visibleGraph = useMemo(() => {
-    const neighborhood = buildNeighborhood(graphData, focusedId);
-    depthByIdRef.current = neighborhood.depthById;
-    return neighborhood.data;
-  }, [focusedId, graphData]);
+  const rebuildIndexes = useCallback(() => {
+    const degrees = new Map<string, number>();
+    const neighbors = new Map<string, Set<string>>();
+    linksRef.current.forEach((link) => {
+      const source = endpointId(link.source);
+      const target = endpointId(link.target);
+      degrees.set(source, (degrees.get(source) || 0) + 1);
+      degrees.set(target, (degrees.get(target) || 0) + 1);
+      if (!neighbors.has(source)) neighbors.set(source, new Set());
+      if (!neighbors.has(target)) neighbors.set(target, new Set());
+      neighbors.get(source)?.add(target);
+      neighbors.get(target)?.add(source);
+    });
+    degreeRef.current = degrees;
+    neighborsRef.current = neighbors;
+  }, []);
 
   const commitGraph = useCallback(() => {
+    rebuildIndexes();
     setGraphData({
       nodes: Array.from(nodesRef.current.values()),
       links: Array.from(linksRef.current.values())
     });
-  }, []);
+  }, [rebuildIndexes]);
 
-  const resetGraph = useCallback(() => {
-    const seed = makeSeedNode(seedPmid);
-    nodesRef.current = new Map([[seedPmid, seed]]);
-    linksRef.current = new Map();
-    expandedRef.current = new Set();
-    loadingRef.current = new Set();
-    focusTokenRef.current += 1;
-    focusedIdRef.current = seedPmid;
-    setFocusedId(seedPmid);
-    setStatus('Loading seed article');
-    setError(null);
-    setGraphData({ nodes: [seed], links: [] });
-  }, [seedPmid]);
-
-  useEffect(() => {
-    resetGraph();
-  }, [resetGraph]);
-
-  useEffect(() => {
-    focusedIdRef.current = focusedId;
-  }, [focusedId]);
-
-  const markNodeLoading = useCallback((pmid: string, loading: boolean, failed = false) => {
-    const current = nodesRef.current.get(pmid);
-    if (!current) return;
-    nodesRef.current.set(pmid, { ...current, loading, failed });
-    commitGraph();
-  }, [commitGraph]);
-
-  const loadArticle = useCallback(async (pmid: string, depth = 0): Promise<string[]> => {
-    if (expandedRef.current.has(pmid) || loadingRef.current.has(pmid)) {
-      return outgoingReferenceIds(linksRef.current, pmid);
-    }
-
-    loadingRef.current.add(pmid);
-    markNodeLoading(pmid, true, false);
-
-    try {
-      const response = await fetch(`/api/pubmed/article?pmid=${pmid}&limit=${REFERENCE_LIMIT}`, { cache: 'force-cache' });
-      const data = (await response.json()) as PubMedArticleResponse;
-
-      if (!response.ok || data.error) {
-        throw new Error(data.error || `Could not load PMID ${pmid}`);
-      }
-
-      const previousArticle = nodesRef.current.get(data.article.pmid);
-      nodesRef.current.set(data.article.pmid, {
-        ...previousArticle,
-        ...data.article,
-        id: data.article.pmid,
-        depth: Math.min(previousArticle?.depth ?? depth, depth),
-        isSeed: data.article.pmid === seedPmid,
-        expanded: true,
-        loading: false,
-        failed: false,
-        val: data.article.pmid === seedPmid ? 12 : 7
+  const mergeGraph = useCallback(
+    (data: GraphResponse, origin?: GraphNode) => {
+      data.nodes.forEach((incoming) => {
+        const existing = nodesRef.current.get(incoming.pmid);
+        if (existing) {
+          existing.title = incoming.title || existing.title;
+          existing.year = incoming.year || existing.year;
+          existing.source = incoming.source || existing.source;
+          existing.depth = Math.min(existing.depth, incoming.depth);
+        } else {
+          const angle = Math.random() * Math.PI * 2;
+          const distance = 30 + Math.random() * 50;
+          nodesRef.current.set(incoming.pmid, {
+            ...incoming,
+            id: incoming.pmid,
+            x: (origin?.x ?? 0) + Math.cos(angle) * distance,
+            y: (origin?.y ?? 0) + Math.sin(angle) * distance
+          } as GraphNode);
+        }
       });
 
-      data.references.slice(0, REFERENCE_LIMIT).forEach((reference) => {
-        const previous = nodesRef.current.get(reference.pmid);
-        nodesRef.current.set(reference.pmid, {
-          ...previous,
-          ...reference,
-          id: reference.pmid,
-          depth: Math.min(previous?.depth ?? depth + 1, depth + 1),
-          expanded: previous?.expanded || false,
-          loading: previous?.loading || false,
-          failed: previous?.failed || false,
-          val: Math.max(previous?.val || 0, 5.6 - depth * 0.35)
-        });
+      data.links.forEach((link) => {
+        const key = link.source < link.target ? `${link.source}|${link.target}` : `${link.target}|${link.source}`;
+        if (!linksRef.current.has(key)) {
+          linksRef.current.set(key, { source: link.source, target: link.target });
+        }
       });
 
-      data.links.slice(0, REFERENCE_LIMIT).forEach((link) => {
-        linksRef.current.set(`${link.source}->${link.target}`, {
-          source: link.source,
-          target: link.target,
-          type: 'reference'
-        });
-      });
-
-      expandedRef.current.add(pmid);
       commitGraph();
-      return outgoingReferenceIds(linksRef.current, pmid);
-    } catch (fetchError) {
-      const message = fetchError instanceof Error ? fetchError.message : 'Unknown loading error';
-      setError(message);
-      markNodeLoading(pmid, false, true);
-      return outgoingReferenceIds(linksRef.current, pmid);
-    } finally {
-      loadingRef.current.delete(pmid);
-    }
-  }, [commitGraph, markNodeLoading, seedPmid]);
+    },
+    [commitGraph]
+  );
 
-  const ensureFiveDegrees = useCallback(async (centerId: string) => {
-    const token = ++focusTokenRef.current;
-    const visited = new Set<string>([centerId]);
-    const queue: Array<{ id: string; depth: number }> = [{ id: centerId, depth: 0 }];
-    let fetches = 0;
+  const fetchDetail = useCallback((pmid: string): Promise<ArticleResponse | null> => {
+    const cached = detailsRef.current.get(pmid);
+    if (cached) return Promise.resolve(cached);
+    const pending = pendingDetailRef.current.get(pmid);
+    if (pending) return pending;
 
-    setError(null);
-    setStatus(`Expanding 5 degrees from PMID ${centerId}`);
+    const request = (async () => {
+      try {
+        const response = await fetch(`/api/pubmed/article?pmid=${pmid}`);
+        const data = (await response.json()) as ArticleResponse;
+        if (!response.ok || data.error) throw new Error(data.error || `Could not load PMID ${pmid}`);
+        detailsRef.current.set(pmid, data);
+        return data;
+      } catch (fetchError) {
+        setError(fetchError instanceof Error ? fetchError.message : 'Could not reach PubMed.');
+        return null;
+      } finally {
+        pendingDetailRef.current.delete(pmid);
+      }
+    })();
 
-    while (queue.length > 0 && token === focusTokenRef.current && fetches < MAX_AUTO_FETCHES_PER_FOCUS) {
-      const current = queue.shift();
-      if (!current || current.depth >= RENDER_DEGREES) continue;
+    pendingDetailRef.current.set(pmid, request);
+    return request;
+  }, []);
 
-      const wasExpanded = expandedRef.current.has(current.id);
-      const references = await loadArticle(current.id, current.depth);
-      if (token !== focusTokenRef.current) return;
-      if (!wasExpanded) fetches += 1;
+  const expandGraphFrom = useCallback(
+    async (pmid: string) => {
+      if (expandedGraphRef.current.has(pmid)) return;
+      expandedGraphRef.current.add(pmid);
+      try {
+        const response = await fetch(`/api/pubmed/graph?pmid=${pmid}&depth=2`);
+        const data = (await response.json()) as GraphResponse;
+        if (!response.ok || data.error) return;
+        mergeGraph(data, nodesRef.current.get(pmid));
+      } catch {
+        expandedGraphRef.current.delete(pmid);
+      }
+    },
+    [mergeGraph]
+  );
 
-      references.forEach((referenceId) => {
-        if (visited.has(referenceId)) return;
-        visited.add(referenceId);
-        queue.push({ id: referenceId, depth: current.depth + 1 });
-      });
-
-      setStatus(`Rendering ${Math.min(RENDER_DEGREES, current.depth + 1)}/5 degrees from PMID ${centerId}`);
-    }
-
-    if (token === focusTokenRef.current) {
-      setStatus(`${visited.size} papers loaded around PMID ${centerId}`);
-    }
-  }, [loadArticle]);
+  // Initial load: pull the seed's whole neighbourhood so the screen is full.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setLoading(true);
+      setError(null);
+      try {
+        const response = await fetch(`/api/pubmed/graph?pmid=${seedPmid}&depth=3`);
+        const data = (await response.json()) as GraphResponse;
+        if (cancelled) return;
+        if (!response.ok || data.error) throw new Error(data.error || 'Could not build the graph.');
+        expandedGraphRef.current.add(seedPmid);
+        mergeGraph(data);
+        // Re-fit a few times as the force layout settles so the web lands
+        // centered and filling the viewport.
+        [900, 2200, 4000, 6200].forEach((wait) => {
+          window.setTimeout(() => {
+            if (!cancelled) graphRef.current?.zoomToFit(600, 55);
+          }, wait);
+        });
+      } catch (fetchError) {
+        if (!cancelled) setError(fetchError instanceof Error ? fetchError.message : 'Could not build the graph.');
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [seedPmid, mergeGraph]);
 
   useEffect(() => {
-    if (!focusedId) return;
-    void ensureFiveDegrees(focusedId);
-  }, [ensureFiveDegrees, focusedId]);
+    selectedRef.current = selectedId;
+  }, [selectedId]);
 
-  const focusNode = useCallback((node: PaperNode, center = true) => {
-    setFocusedId(node.id);
-    focusedIdRef.current = node.id;
+  useEffect(() => {
+    if (!error) return;
+    const timer = window.setTimeout(() => setError(null), 5000);
+    return () => window.clearTimeout(timer);
+  }, [error]);
 
-    if (center && graphRef.current && typeof node.x === 'number' && typeof node.y === 'number') {
-      graphRef.current.centerAt(node.x, node.y, 650);
-      const zoom = graphRef.current.zoom?.() || 1;
-      if (zoom < 0.9) graphRef.current.zoom(0.95, 650);
-    }
-  }, []);
-
-  const updateFocusFromViewport = useCallback(() => {
+  // Tighten the force layout toward an Obsidian-like density.
+  useEffect(() => {
     const graph = graphRef.current;
-    if (!graph?.screen2GraphCoords) return;
+    if (!graph || graphData.nodes.length === 0) return;
+    graph.d3Force('charge')?.strength(-95).distanceMax(420);
+    graph.d3Force('link')?.distance(36).strength(0.82);
+    graph.d3Force('center')?.strength(0.045);
+  }, [graphData.nodes.length]);
 
-    const center = graph.screen2GraphCoords(window.innerWidth * 0.44, window.innerHeight * 0.5);
-    let nearestId: string | null = null;
-    let nearestDistance = Number.POSITIVE_INFINITY;
+  const selectArticle = useCallback(
+    (pmid: string) => {
+      setSelectedId(pmid);
+      selectedRef.current = pmid;
+      setSelectedDetail(detailsRef.current.get(pmid) || null);
+      void fetchDetail(pmid).then((detail) => {
+        if (detail && selectedRef.current === pmid) setSelectedDetail(detail);
+      });
+      void expandGraphFrom(pmid);
 
-    visibleGraph.nodes.forEach((node) => {
-      if (typeof node.x !== 'number' || typeof node.y !== 'number') return;
-      const distance = Math.hypot(node.x - center.x, node.y - center.y);
-      if (distance < nearestDistance) {
-        nearestId = node.id;
-        nearestDistance = distance;
+      const node = nodesRef.current.get(pmid);
+      if (node && graphRef.current && typeof node.x === 'number' && typeof node.y === 'number') {
+        graphRef.current.centerAt(node.x, node.y, 600);
       }
-    });
+    },
+    [fetchDetail, expandGraphFrom]
+  );
 
-    if (nearestId && nearestId !== focusedIdRef.current) {
-      setFocusedId(nearestId);
-      focusedIdRef.current = nearestId;
-    }
-  }, [visibleGraph.nodes]);
-
-  const scheduleViewportFocusUpdate = useCallback(() => {
-    if (viewportFocusTimerRef.current) window.clearTimeout(viewportFocusTimerRef.current);
-    viewportFocusTimerRef.current = window.setTimeout(updateFocusFromViewport, 160);
-  }, [updateFocusFromViewport]);
-
-  const drawNode = useCallback((node: PaperNode, ctx: CanvasRenderingContext2D, globalScale: number) => {
-    const degree = depthByIdRef.current.get(node.id) ?? RENDER_DEGREES;
-    const isFocused = node.id === focusedIdRef.current;
-    const opacity = isFocused ? 1 : Math.max(0.22, 0.92 - degree * 0.13);
-    const radius = isFocused ? 8.4 : Math.max(3.7, 6.2 - degree * 0.35);
-    const x = node.x || 0;
-    const y = node.y || 0;
-
-    ctx.save();
-    ctx.globalAlpha = opacity;
-
-    const glowRadius = radius * (isFocused ? 5.2 : 3.3);
-    const glow = ctx.createRadialGradient(x, y, radius * 0.2, x, y, glowRadius);
-    glow.addColorStop(0, isFocused ? 'rgba(255,255,255,0.38)' : 'rgba(200,212,255,0.24)');
-    glow.addColorStop(1, 'rgba(200,212,255,0)');
-    ctx.fillStyle = glow;
-    ctx.beginPath();
-    ctx.arc(x, y, glowRadius, 0, Math.PI * 2);
-    ctx.fill();
-
-    const nodeGradient = ctx.createRadialGradient(x - radius * 0.28, y - radius * 0.32, radius * 0.2, x, y, radius);
-    nodeGradient.addColorStop(0, node.failed ? '#ffd2d2' : '#ffffff');
-    nodeGradient.addColorStop(0.45, node.failed ? '#ffaaaa' : '#cfd8ff');
-    nodeGradient.addColorStop(1, node.failed ? '#bc6060' : '#6f83c9');
-
-    ctx.fillStyle = nodeGradient;
-    ctx.strokeStyle = isFocused ? 'rgba(255,255,255,0.86)' : 'rgba(255,255,255,0.42)';
-    ctx.lineWidth = isFocused ? 1.5 / globalScale : 0.8 / globalScale;
-    ctx.beginPath();
-    ctx.arc(x, y, radius, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.stroke();
-
-    if (node.loading) {
-      ctx.strokeStyle = 'rgba(255,255,255,0.75)';
-      ctx.lineWidth = 1.2 / globalScale;
-      ctx.beginPath();
-      ctx.arc(x, y, radius + 3, 0, Math.PI * 1.35);
-      ctx.stroke();
-    }
-
-    if (isFocused || degree <= 1 || globalScale > 1.25) {
-      const label = shortTitle(node.title, isFocused ? 70 : 42);
-      const fontSize = (isFocused ? 13 : 10) / globalScale;
-      ctx.font = `${fontSize}px Inter, ui-sans-serif, system-ui`;
-      const width = ctx.measureText(label).width;
-      const labelX = x - width / 2;
-      const labelY = y + radius + 15 / globalScale;
-      const padX = 7 / globalScale;
-      const padY = 4 / globalScale;
-
-      ctx.fillStyle = isFocused ? 'rgba(9,10,14,0.88)' : 'rgba(9,10,14,0.68)';
-      ctx.strokeStyle = isFocused ? 'rgba(255,255,255,0.2)' : 'rgba(255,255,255,0.1)';
-      ctx.lineWidth = 1 / globalScale;
-      ctx.beginPath();
-      ctx.roundRect(labelX - padX, labelY - fontSize - padY, width + padX * 2, fontSize + padY * 2, 8 / globalScale);
-      ctx.fill();
-      ctx.stroke();
-
-      ctx.fillStyle = isFocused ? 'rgba(247,247,242,0.96)' : 'rgba(247,247,242,0.72)';
-      ctx.fillText(label, labelX, labelY - 2 / globalScale);
-    }
-
-    ctx.restore();
+  const nodeColor = useCallback((node: GraphNode) => {
+    const { x, y, maxR } = centerRef.current;
+    const dist = Math.hypot((node.x || 0) - x, (node.y || 0) - y);
+    return rampColor(dist / maxR);
   }, []);
 
-  const drawPointerArea = useCallback((node: PaperNode, color: string, ctx: CanvasRenderingContext2D) => {
+  const drawNode = useCallback(
+    (node: GraphNode, ctx: CanvasRenderingContext2D, globalScale: number) => {
+      const hoveredId = hoverRef.current;
+      const currentSelectedId = selectedRef.current;
+      const isHovered = node.id === hoveredId;
+      const isSelected = node.id === currentSelectedId;
+      const isNeighborOfHover = hoveredId ? neighborsRef.current.get(hoveredId)?.has(node.id) : false;
+      const dimmed = Boolean(hoveredId) && !isHovered && !isNeighborOfHover && !isSelected;
+
+      const degree = degreeRef.current.get(node.id) || 0;
+      const baseRadius = 2.4 + Math.min(6.5, Math.sqrt(degree) * 1.2);
+      const radius = isHovered ? baseRadius * 1.4 : baseRadius;
+      const x = node.x || 0;
+      const y = node.y || 0;
+      const color = nodeColor(node);
+
+      ctx.save();
+      ctx.globalAlpha = dimmed ? 0.28 : 1;
+
+      if (isSelected || isHovered) {
+        const glow = ctx.createRadialGradient(x, y, radius * 0.4, x, y, radius * 4.5);
+        glow.addColorStop(0, rampColor(isSelected ? 0.05 : 0.2, 0.4));
+        glow.addColorStop(1, 'rgba(0,0,0,0)');
+        ctx.fillStyle = glow;
+        ctx.beginPath();
+        ctx.arc(x, y, radius * 4.5, 0, Math.PI * 2);
+        ctx.fill();
+      }
+
+      ctx.fillStyle = isSelected ? '#fff2d6' : color;
+      ctx.beginPath();
+      ctx.arc(x, y, radius, 0, Math.PI * 2);
+      ctx.fill();
+
+      if (isSelected) {
+        ctx.strokeStyle = 'rgba(255, 240, 210, 0.9)';
+        ctx.lineWidth = 1.4 / globalScale;
+        ctx.stroke();
+      }
+
+      const showLabel = isHovered || isSelected || globalScale > 2.4;
+      if (showLabel && !dimmed) {
+        const maxChars = isHovered || isSelected ? 62 : 34;
+        const label = node.title.length > maxChars ? `${node.title.slice(0, maxChars - 1).trim()}…` : node.title;
+        const fontSize = 11.5 / globalScale;
+        ctx.font = `${isHovered || isSelected ? 500 : 400} ${fontSize}px ui-sans-serif, system-ui, -apple-system, sans-serif`;
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'top';
+        ctx.fillStyle =
+          isHovered || isSelected ? 'rgba(245, 236, 220, 0.94)' : 'rgba(224, 214, 196, 0.5)';
+        ctx.fillText(label, x, y + radius + 4 / globalScale);
+      }
+
+      ctx.restore();
+    },
+    [nodeColor]
+  );
+
+  const drawPointerArea = useCallback((node: GraphNode, color: string, ctx: CanvasRenderingContext2D) => {
+    const degree = degreeRef.current.get(node.id) || 0;
+    const radius = 2.4 + Math.min(6.5, Math.sqrt(degree) * 1.2) + 5;
     ctx.fillStyle = color;
     ctx.beginPath();
-    ctx.arc(node.x || 0, node.y || 0, 14, 0, 2 * Math.PI, false);
+    ctx.arc(node.x || 0, node.y || 0, radius, 0, Math.PI * 2);
     ctx.fill();
   }, []);
 
+  const updateCentroid = useCallback(() => {
+    const nodes = nodesRef.current;
+    if (nodes.size === 0) return;
+    let sumX = 0;
+    let sumY = 0;
+    nodes.forEach((node) => {
+      sumX += node.x || 0;
+      sumY += node.y || 0;
+    });
+    const cx = sumX / nodes.size;
+    const cy = sumY / nodes.size;
+    let maxR = 1;
+    nodes.forEach((node) => {
+      const dist = Math.hypot((node.x || 0) - cx, (node.y || 0) - cy);
+      if (dist > maxR) maxR = dist;
+    });
+    centerRef.current = { x: cx, y: cy, maxR };
+  }, []);
+
+  const linkColor = useCallback((link: GraphLink) => {
+    const hoveredId = hoverRef.current;
+    const currentSelectedId = selectedRef.current;
+    const source = endpointId(link.source);
+    const target = endpointId(link.target);
+    if (hoveredId && (source === hoveredId || target === hoveredId)) return 'rgba(245, 210, 150, 0.55)';
+    if (currentSelectedId && (source === currentSelectedId || target === currentSelectedId))
+      return 'rgba(255, 226, 170, 0.5)';
+    if (hoveredId) return 'rgba(180, 150, 120, 0.05)';
+    return 'rgba(198, 168, 138, 0.22)';
+  }, []);
+
+  const linkWidth = useCallback((link: GraphLink) => {
+    const hoveredId = hoverRef.current;
+    const source = endpointId(link.source);
+    const target = endpointId(link.target);
+    return hoveredId && (source === hoveredId || target === hoveredId) ? 1.3 : 0.55;
+  }, []);
+
+  const referenceRow = (paper: PaperSummary) => (
+    <li key={paper.pmid}>
+      <button className="paper-row" onClick={() => selectArticle(paper.pmid)}>
+        <span className="paper-row-title">{paper.title}</span>
+        <span className="paper-row-meta">
+          {paper.year}
+          {paper.source ? ` · ${paper.source}` : ''}
+        </span>
+      </button>
+    </li>
+  );
+
+  const selectedNode = selectedId ? nodesRef.current.get(selectedId) || null : null;
+
   return (
-    <main className="research-shell">
-      <div className="graph-canvas" aria-label="Research paper reference graph">
+    <main className="shell">
+      <DotField />
+
+      <div className="graph-layer">
         <ForceGraph2D
           ref={graphRef}
-          graphData={visibleGraph}
+          graphData={graphData}
           backgroundColor="rgba(0,0,0,0)"
           nodeId="id"
-          nodeVal={(node: PaperNode) => (node.id === focusedId ? 11 : Math.max(3.5, node.val || 4))}
-          nodeRelSize={4}
           nodeCanvasObject={drawNode}
           nodePointerAreaPaint={drawPointerArea}
-          linkColor={(link: PaperLink) => {
-            const source = linkEndpointId(link.source);
-            const degree = depthByIdRef.current.get(source) ?? RENDER_DEGREES;
-            return `rgba(202,213,255,${Math.max(0.08, 0.58 - degree * 0.09)})`;
+          linkColor={linkColor}
+          linkWidth={linkWidth}
+          autoPauseRedraw={false}
+          d3AlphaDecay={0.028}
+          d3VelocityDecay={0.42}
+          warmupTicks={60}
+          cooldownTime={5000}
+          onRenderFramePre={updateCentroid}
+          onNodeHover={(node: GraphNode | null) => {
+            hoverRef.current = node ? node.id : null;
+            document.body.style.cursor = node ? 'pointer' : '';
           }}
-          linkWidth={(link: PaperLink) => {
-            const source = linkEndpointId(link.source);
-            const target = linkEndpointId(link.target);
-            return source === focusedId || target === focusedId ? 1.25 : 0.45;
+          onNodeClick={(node: GraphNode) => selectArticle(node.id)}
+          onNodeDragEnd={(node: GraphNode) => {
+            node.fx = undefined;
+            node.fy = undefined;
           }}
-          linkDirectionalParticles={(link: PaperLink) => (linkEndpointId(link.source) === focusedId ? 2 : 0)}
-          linkDirectionalParticleWidth={1.7}
-          linkDirectionalParticleSpeed={0.005}
-          d3AlphaDecay={0.025}
-          d3VelocityDecay={0.28}
-          cooldownTicks={160}
-          enableNodeDrag
-          enablePanInteraction
-          enableZoomInteraction
-          onNodeClick={(node: PaperNode) => focusNode(node, true)}
-          onNodeDragEnd={(node: PaperNode) => focusNode(node, false)}
-          onZoomEnd={scheduleViewportFocusUpdate}
-          onEngineStop={scheduleViewportFocusUpdate}
+          onBackgroundClick={() => setSelectedId(null)}
+          onEngineStop={() => {
+            if (!didFitRef.current && graphRef.current && graphData.nodes.length > 0) {
+              didFitRef.current = true;
+              graphRef.current.zoomToFit(700, 90);
+            }
+          }}
         />
       </div>
 
-      <div className={`focus-blur${focusedId ? ' active' : ''}`} />
-      <div className="vignette" />
+      <header className="wordmark">research web</header>
 
-      <div className="topbar">
-        <section className="brand-card">
-          <h1 className="brand-title">ResearchWeb</h1>
-          <p className="brand-subtitle">
-            Obsidian-style PubMed graph. The paper closest to the viewport center becomes active and auto-loads five outward levels.
+      {loading ? (
+        <div className="boot-state">
+          <span className="boot-spinner" />
+          building the research web…
+        </div>
+      ) : null}
+      {error ? <div className="error-toast">{error}</div> : null}
+
+      {selectedId && (selectedDetail || selectedNode) ? (
+        <aside className="paper-card" role="dialog" aria-label="Article details">
+          <div className="card-sheen" aria-hidden="true" />
+          <button className="card-close" onClick={() => setSelectedId(null)} aria-label="Close">
+            ×
+          </button>
+
+          <h2 className="card-title">{selectedDetail?.article.title || selectedNode?.title}</h2>
+          <p className="card-meta">
+            {[selectedDetail?.article.year || selectedNode?.year, selectedDetail?.article.source || selectedNode?.source]
+              .filter(Boolean)
+              .join(' · ')}
           </p>
-        </section>
 
-        <section className="status-card">
-          <strong>{visibleGraph.nodes.length}</strong>
-          visible · {graphData.nodes.length} loaded
-          <br />
-          {error ? <span className="error-text">{error}</span> : status}
-        </section>
-      </div>
+          <div className="card-body">
+            {selectedDetail ? (
+              <>
+                {selectedDetail.article.abstract ? (
+                  <p className="card-abstract">{selectedDetail.article.abstract}</p>
+                ) : (
+                  <p className="card-abstract muted">No abstract available.</p>
+                )}
 
-      <aside className="side-wrap">
-        {focusedNode ? (
-          <section className="paper-panel">
-            <header>
-              <p className="kicker">PMID {focusedNode.pmid}</p>
-              <h2 className="paper-title">{focusedNode.title}</h2>
-              <div className="meta-row">
-                {focusedNode.year ? <span className="pill">{focusedNode.year}</span> : null}
-                <span className="pill">{focusedNode.source}</span>
-                {focusedNode.loading ? (
-                  <span className="pill loading-chip"><span className="loading-dot" /> loading</span>
-                ) : null}
-                {focusedNode.expanded ? <span className="pill">expanded</span> : null}
-                <span className="pill">5-degree view</span>
-              </div>
-              <div className="panel-actions">
-                <button className="ghost-button" onClick={() => void ensureFiveDegrees(focusedNode.id)}>
-                  Refresh neighborhood
-                </button>
-                <button className="ghost-button" onClick={() => window.open(`https://pubmed.ncbi.nlm.nih.gov/${focusedNode.pmid}/`, '_blank')}>
-                  Open PubMed
-                </button>
-              </div>
-            </header>
+                <h3 className="card-section">References ({selectedDetail.references.length})</h3>
+                {selectedDetail.references.length > 0 ? (
+                  <ul className="paper-list">{selectedDetail.references.map(referenceRow)}</ul>
+                ) : (
+                  <p className="card-empty">None indexed on PubMed.</p>
+                )}
 
-            <ul className="reference-list" aria-label="References">
-              {focusedNode.loading ? (
-                <li className="reference-meta">Loading references from PubMed.</li>
-              ) : selectedReferences.length > 0 ? (
-                selectedReferences.map((reference) => (
-                  <li key={reference.id}>
-                    <button className="reference-button" onClick={() => focusNode(reference, true)}>
-                      <span className="reference-title">{reference.title}</span>
-                      <span className="reference-meta">
-                        PMID {reference.pmid}{reference.year ? ` · ${reference.year}` : ''}
-                      </span>
-                    </button>
-                  </li>
-                ))
-              ) : (
-                <li className="reference-meta">References are loading automatically for the centered paper.</li>
-              )}
-            </ul>
-          </section>
-        ) : (
-          <section className="empty-panel">
-            <p>Pan the graph or click a node. The node closest to the viewport center becomes active.</p>
-            <button className="ghost-button" onClick={() => setFocusedId(seedPmid)}>Return to seed</button>
-          </section>
-        )}
-      </aside>
-
-      <section className="hint-card">
-        Drag nodes, pan, and zoom like an Obsidian graph. The viewport-center paper is the active node and loads its next five levels automatically.
-      </section>
+                <h3 className="card-section">Cited by ({selectedDetail.citedBy.length})</h3>
+                {selectedDetail.citedBy.length > 0 ? (
+                  <ul className="paper-list">{selectedDetail.citedBy.map(referenceRow)}</ul>
+                ) : (
+                  <p className="card-empty">None indexed on PubMed.</p>
+                )}
+              </>
+            ) : (
+              <p className="card-abstract muted">Loading…</p>
+            )}
+          </div>
+        </aside>
+      ) : null}
     </main>
   );
 }
