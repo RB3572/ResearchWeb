@@ -1,11 +1,6 @@
 'use client';
 
-import dynamic from 'next/dynamic';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import * as THREE from 'three';
-import SpriteText from 'three-spritetext';
-
-const ForceGraph3D = dynamic(() => import('react-force-graph-3d'), { ssr: false }) as any;
 
 type PubMedArticle = {
   id: string;
@@ -52,9 +47,22 @@ type ResearchWebGraphProps = {
   seedPmid: string;
 };
 
-function compactTitle(title: string, maxLength = 68) {
-  if (title.length <= maxLength) return title;
-  return `${title.slice(0, maxLength - 1).trim()}…`;
+function makeSeedNode(seedPmid: string): PaperNode {
+  return {
+    id: seedPmid,
+    pmid: seedPmid,
+    title: `PMID ${seedPmid}`,
+    authors: [],
+    source: 'PubMed',
+    pubdate: '',
+    year: '',
+    depth: 0,
+    isSeed: true,
+    expanded: false,
+    loading: true,
+    failed: false,
+    val: 10
+  };
 }
 
 function linkEndpointId(endpoint: string | PaperNode) {
@@ -89,11 +97,16 @@ function mergeGraph(existing: GraphData, incomingNodes: PaperNode[], incomingLin
 }
 
 export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
-  const graphRef = useRef<any>(null);
+  const graphElRef = useRef<HTMLDivElement | null>(null);
+  const graphInstanceRef = useRef<any>(null);
+  const selectedIdRef = useRef<string | null>(seedPmid);
+  const focusIdsRef = useRef<Set<string>>(new Set([seedPmid]));
+  const selectNodeRef = useRef<(node: PaperNode) => void>(() => {});
   const expandedRef = useRef(new Set<string>());
   const loadingRef = useRef(new Set<string>());
+  const hasFitGraphRef = useRef(false);
 
-  const [graphData, setGraphData] = useState<GraphData>({ nodes: [], links: [] });
+  const [graphData, setGraphData] = useState<GraphData>(() => ({ nodes: [makeSeedNode(seedPmid)], links: [] }));
   const [selectedId, setSelectedId] = useState<string | null>(seedPmid);
   const [status, setStatus] = useState('Loading seed article');
   const [error, setError] = useState<string | null>(null);
@@ -133,6 +146,16 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
     return ids;
   }, [graphData.links, selectedId]);
 
+  useEffect(() => {
+    selectedIdRef.current = selectedId;
+    focusIdsRef.current = focusIds;
+
+    const graph = graphInstanceRef.current;
+    if (graph) {
+      graph.graphData(graphData);
+    }
+  }, [focusIds, graphData, selectedId]);
+
   const expandArticle = useCallback(async (pmid: string, depth = 0) => {
     if (expandedRef.current.has(pmid) || loadingRef.current.has(pmid)) return;
 
@@ -145,7 +168,7 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
     }));
 
     try {
-      const response = await fetch(`/api/pubmed/article?pmid=${pmid}&limit=28`);
+      const response = await fetch(`/api/pubmed/article?pmid=${pmid}&limit=34`, { cache: 'force-cache' });
       const data = (await response.json()) as PubMedArticleResponse;
 
       if (!response.ok || data.error) {
@@ -160,7 +183,7 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
         expanded: true,
         loading: false,
         failed: false,
-        val: data.article.pmid === seedPmid ? 9 : 5
+        val: data.article.pmid === seedPmid ? 12 : 7
       };
 
       const referenceNodes: PaperNode[] = data.references.map((reference) => ({
@@ -170,7 +193,7 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
         expanded: false,
         loading: false,
         failed: false,
-        val: Math.max(2.5, 4.6 - depth * 0.45)
+        val: Math.max(3.4, 6 - depth * 0.5)
       }));
 
       const links: PaperLink[] = data.links.map((link) => ({
@@ -198,59 +221,30 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
   }, [seedPmid]);
 
   useEffect(() => {
-    setGraphData({
-      nodes: [
-        {
-          id: seedPmid,
-          pmid: seedPmid,
-          title: `PMID ${seedPmid}`,
-          authors: [],
-          source: 'PubMed',
-          pubdate: '',
-          year: '',
-          depth: 0,
-          isSeed: true,
-          expanded: false,
-          loading: true,
-          failed: false,
-          val: 9
-        }
-      ],
-      links: []
-    });
+    setGraphData({ nodes: [makeSeedNode(seedPmid)], links: [] });
     setSelectedId(seedPmid);
+    setStatus('Loading seed article');
+    setError(null);
+    hasFitGraphRef.current = false;
     expandedRef.current.clear();
     loadingRef.current.clear();
     void expandArticle(seedPmid, 0);
   }, [expandArticle, seedPmid]);
 
-  useEffect(() => {
-    if (!graphRef.current) return;
-
-    graphRef.current.d3Force('charge')?.strength(-110);
-    graphRef.current.d3Force('link')?.distance(78);
-    graphRef.current.d3Force('center')?.strength?.(0.08);
-  }, [graphData.nodes.length]);
-
-  useEffect(() => {
-    if (!graphRef.current) return;
-    const scene = graphRef.current.scene();
-    scene.fog = new THREE.FogExp2(0x050507, selectedId ? 0.004 : 0.0021);
-  }, [selectedId]);
-
   const focusCameraOnNode = useCallback((node: PaperNode) => {
-    if (!graphRef.current || typeof node.x !== 'number' || typeof node.y !== 'number' || typeof node.z !== 'number') {
+    const graph = graphInstanceRef.current;
+    if (!graph || typeof node.x !== 'number' || typeof node.y !== 'number' || typeof node.z !== 'number') {
       return;
     }
 
-    const distance = 120;
+    const distance = 150;
     const length = Math.hypot(node.x, node.y, node.z) || 1;
     const ratio = 1 + distance / length;
 
-    graphRef.current.cameraPosition(
+    graph.cameraPosition(
       { x: node.x * ratio, y: node.y * ratio, z: node.z * ratio },
       { x: node.x, y: node.y, z: node.z },
-      900
+      850
     );
   }, []);
 
@@ -260,90 +254,119 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
     void expandArticle(node.id, node.depth);
   }, [expandArticle, focusCameraOnNode]);
 
-  const isLinkFocused = useCallback((link: PaperLink) => {
-    if (!selectedId) return true;
-    const source = linkEndpointId(link.source);
-    const target = linkEndpointId(link.target);
-    return source === selectedId || target === selectedId;
-  }, [selectedId]);
+  useEffect(() => {
+    selectNodeRef.current = selectNode;
+  }, [selectNode]);
 
-  const nodeObject = useCallback((node: PaperNode) => {
-    const group = new THREE.Group();
-    const isSelected = node.id === selectedId;
-    const isContext = !selectedId || focusIds.has(node.id);
-    const isSeed = node.isSeed;
-    const radius = isSelected ? 5.4 : isSeed ? 4.6 : 3.1;
-    const color = node.failed ? '#ff9999' : isSelected ? '#ffffff' : isSeed ? '#c8d4ff' : '#9eb6d8';
-    const opacity = isContext ? (isSelected ? 1 : 0.76) : 0.1;
+  useEffect(() => {
+    let destroyed = false;
+    let graph: any;
 
-    const sphere = new THREE.Mesh(
-      new THREE.SphereGeometry(radius, 28, 28),
-      new THREE.MeshBasicMaterial({
-        color,
-        transparent: true,
-        opacity,
-        depthWrite: false
-      })
-    );
+    async function initializeGraph() {
+      if (!graphElRef.current || graphInstanceRef.current) return;
 
-    const glow = new THREE.Mesh(
-      new THREE.SphereGeometry(radius * 2.45, 28, 28),
-      new THREE.MeshBasicMaterial({
-        color,
-        transparent: true,
-        opacity: isSelected ? 0.09 : isContext ? 0.035 : 0.006,
-        depthWrite: false
-      })
-    );
+      const module = await import('3d-force-graph');
+      if (destroyed || !graphElRef.current) return;
 
-    group.add(glow);
-    group.add(sphere);
+      const ForceGraph3D = module.default || module;
+      graph = ForceGraph3D()(graphElRef.current);
+      graphInstanceRef.current = graph;
 
-    if (isSelected || isSeed || node.depth < 2) {
-      const label = new SpriteText(compactTitle(node.title, isSelected ? 76 : 42));
-      label.color = isContext ? 'rgba(247, 247, 242, 0.88)' : 'rgba(247, 247, 242, 0.16)';
-      label.textHeight = isSelected ? 4.1 : 2.35;
-      label.position.y = radius + 4.2;
-      label.material.depthWrite = false;
-      label.material.transparent = true;
-      label.material.opacity = isContext ? (isSelected ? 0.95 : 0.62) : 0.14;
-      group.add(label);
+      const isNodeFocused = (node: PaperNode) => {
+        const selected = selectedIdRef.current;
+        return !selected || focusIdsRef.current.has(node.id);
+      };
+
+      const isLinkFocused = (link: PaperLink) => {
+        const selected = selectedIdRef.current;
+        if (!selected) return true;
+        const source = linkEndpointId(link.source);
+        const target = linkEndpointId(link.target);
+        return source === selected || target === selected;
+      };
+
+      graph
+        .backgroundColor('rgba(0,0,0,0)')
+        .showNavInfo(false)
+        .nodeId('id')
+        .nodeVal((node: PaperNode) => {
+          if (node.id === selectedIdRef.current) return 18;
+          if (node.isSeed) return 13;
+          return node.val;
+        })
+        .nodeResolution(24)
+        .nodeColor((node: PaperNode) => {
+          if (node.failed) return '#ffb4b4';
+          if (node.id === selectedIdRef.current) return '#ffffff';
+          if (node.isSeed) return '#d6ddff';
+          return isNodeFocused(node) ? '#aebee8' : '#293041';
+        })
+        .nodeOpacity((node: PaperNode) => (isNodeFocused(node) ? 0.96 : 0.14))
+        .nodeLabel((node: PaperNode) => {
+          const authors = node.authors.length ? node.authors.slice(0, 3).join(', ') : 'Unknown authors';
+          const date = node.year ? ` (${node.year})` : '';
+          return `${node.title}${date}<br/><span style="opacity:.65">${authors}</span>`;
+        })
+        .linkColor((link: PaperLink) => (isLinkFocused(link) ? '#c7d1ff' : '#1a1d29'))
+        .linkOpacity((link: PaperLink) => (isLinkFocused(link) ? 0.52 : 0.055))
+        .linkWidth((link: PaperLink) => (isLinkFocused(link) ? 0.9 : 0.18))
+        .linkDirectionalParticles((link: PaperLink) => (isLinkFocused(link) ? 1 : 0))
+        .linkDirectionalParticleWidth(1.4)
+        .linkDirectionalParticleSpeed(0.0032)
+        .enableNodeDrag(true)
+        .onNodeClick((node: PaperNode) => selectNodeRef.current(node))
+        .onBackgroundClick(() => setSelectedId(null))
+        .graphData(graphData);
+
+      graph.d3Force('charge')?.strength(-135);
+      graph.d3Force('link')?.distance(92);
+      graph.d3Force('center')?.strength?.(0.08);
+
+      const scene = graph.scene?.();
+      if (scene && module) {
+        const three = await import('three');
+        scene.fog = new three.FogExp2(0x050507, 0.0028);
+      }
+
+      const resize = () => {
+        if (!graphElRef.current || !graphInstanceRef.current) return;
+        graphInstanceRef.current.width(graphElRef.current.clientWidth).height(graphElRef.current.clientHeight);
+      };
+
+      resize();
+      window.addEventListener('resize', resize);
+
+      return () => window.removeEventListener('resize', resize);
     }
 
-    return group;
-  }, [focusIds, selectedId]);
+    const cleanupPromise = initializeGraph();
 
-  const nodeLabel = useCallback((node: PaperNode) => {
-    const authors = node.authors.length ? node.authors.slice(0, 3).join(', ') : 'Unknown authors';
-    const date = node.year ? ` (${node.year})` : '';
-    return `${node.title}${date}<br/><span style="opacity:.65">${authors}</span>`;
-  }, []);
+    return () => {
+      destroyed = true;
+      cleanupPromise.then((cleanup) => cleanup?.()).catch(() => undefined);
+      if (graphInstanceRef.current?._destructor) {
+        graphInstanceRef.current._destructor();
+      }
+      graphInstanceRef.current = null;
+    };
+  }, [graphData]);
+
+  useEffect(() => {
+    const graph = graphInstanceRef.current;
+    if (!graph) return;
+
+    graph.graphData(graphData);
+    graph.refresh?.();
+
+    if (graphData.nodes.length > 1 && !hasFitGraphRef.current) {
+      hasFitGraphRef.current = true;
+      window.setTimeout(() => graph.zoomToFit?.(650, 90), 300);
+    }
+  }, [graphData, selectedId, focusIds]);
 
   return (
     <main className="research-shell">
-      <div className="graph-canvas">
-        <ForceGraph3D
-          ref={graphRef}
-          graphData={graphData}
-          backgroundColor="rgba(0,0,0,0)"
-          showNavInfo={false}
-          nodeId="id"
-          nodeVal="val"
-          nodeLabel={nodeLabel}
-          nodeThreeObject={nodeObject}
-          nodeThreeObjectExtend={false}
-          linkLabel={() => 'references'}
-          linkColor={(link: PaperLink) => (isLinkFocused(link) ? 'rgba(226, 232, 255, 0.5)' : 'rgba(255, 255, 255, 0.045)')}
-          linkWidth={(link: PaperLink) => (isLinkFocused(link) ? 0.72 : 0.16)}
-          linkDirectionalParticles={(link: PaperLink) => (isLinkFocused(link) ? 1 : 0)}
-          linkDirectionalParticleWidth={1.3}
-          linkDirectionalParticleSpeed={0.0035}
-          cooldownTicks={90}
-          enableNodeDrag
-          onNodeClick={selectNode}
-          onBackgroundClick={() => setSelectedId(null)}
-        />
-      </div>
+      <div className="graph-canvas" ref={graphElRef} aria-label="Research paper reference graph" />
 
       <div className={`focus-blur${selectedId ? ' active' : ''}`} />
       <div className="vignette" />
