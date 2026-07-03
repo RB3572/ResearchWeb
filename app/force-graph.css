@@ -1,0 +1,23 @@
+.graph-canvas {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  cursor: grab;
+}
+
+.graph-canvas:active {
+  cursor: grabbing;
+}
+
+.graph-canvas canvas {
+  display: block;
+}
+
+.graph-canvas .scene-nav-info {
+  display: none !important;
+}
+
+.focus-blur {
+  mask-image: radial-gradient(circle at 44% 50%, transparent 0%, transparent 28%, rgba(0, 0, 0, 0.38) 49%, black 80%);
+  -webkit-mask-image: radial-gradient(circle at 44% 50%, transparent 0%, transparent 28%, rgba(0, 0, 0, 0.38) 49%, black 80%);
+}
