@@ -7,7 +7,8 @@
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
-    "db:init": "node --env-file=.env.local scripts/db-init.mjs"
+    "db:init": "node --env-file=.env.local scripts/db-init.mjs",
+    "crawl": "node --env-file=.env.local scripts/crawl-frontier.mjs"
   },
   "dependencies": {
     "@neondatabase/serverless": "^0.10.4",

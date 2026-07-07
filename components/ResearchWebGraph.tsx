@@ -400,23 +400,10 @@ export default function ResearchWebGraph({ seedPmid }: ResearchWebGraphProps) {
     window.localStorage.setItem('rw-theme', theme);
   }, [theme]);
 
-  // Every visitor pitches in: quietly ask the server to crawl a few un-expanded
-  // articles into Neon. The shared graph grows with traffic and future loads get
-  // faster (already-cached info is never re-fetched). Fire-and-forget.
-  useEffect(() => {
-    let cancelled = false;
-    const contribute = () => {
-      if (cancelled || document.hidden) return;
-      fetch('/api/pubmed/expand?n=2').catch(() => {});
-    };
-    const timers = [6000, 15000, 26000].map((delay) => window.setTimeout(contribute, delay));
-    const interval = window.setInterval(contribute, 45000);
-    return () => {
-      cancelled = true;
-      timers.forEach((timer) => window.clearTimeout(timer));
-      window.clearInterval(interval);
-    };
-  }, []);
+  // The shared Neon graph is grown on a schedule by a GitHub Actions job
+  // (scripts/crawl-frontier.mjs), so the frontier keeps filling in without
+  // per-visitor serverless calls (Hobby-tier friendly). Visitors still add data
+  // by loading DOIs and clicking nodes.
 
   // Obsidian-style force layout: particles repel (charge), links are springs,
   // a gentle centre keeps it in frame. The link force keeps d3's DEFAULT

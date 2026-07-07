@@ -4,6 +4,7 @@ import {
   bulkUpsertStubs,
   ensureSchema,
   getArticles,
+  getUnexpandedFrontier,
   upsertArticle,
   upsertStub
 } from '@/lib/db';
@@ -15,7 +16,9 @@ const REF_CAP = 16;
 const CITE_CAP = 16;
 const MAX_NODES = 400;
 // elink drops connections when too many ids are batched — keep chunks small.
+// Citations (citedin) of old papers are enormous, so use an even smaller chunk.
 const ELINK_CHUNK = 5;
+const ELINK_CITE_CHUNK = 3;
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -25,6 +28,100 @@ function chunk<T>(items: T[], size: number): T[][] {
   const out: T[][] = [];
   for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
   return out;
+}
+
+/**
+ * Structure-only expansion of a SET of articles in a handful of batched
+ * requests, written in two bulk upserts. Each target becomes an EXPANDED row
+ * (abstract skipped — fetched on click); their neighbours become stubs.
+ *
+ * `includeCitedBy` controls whether citations are fetched. Citations of old
+ * papers are huge and slow, so the time-sensitive seed build leaves it off
+ * (the seed itself still has both directions from its full ingest), while the
+ * background frontier crawl turns it on to accumulate both edge directions
+ * across the whole graph over time.
+ */
+async function batchExpand(ids: string[], includeCitedBy: boolean): Promise<void> {
+  const targets = Array.from(new Set(ids.filter(Boolean)));
+  if (targets.length === 0) return;
+
+  const refsMap = new Map<string, string[]>();
+  const citesMap = new Map<string, string[]>();
+
+  for (const group of chunk(targets, ELINK_CHUNK)) {
+    const refs = await fetchLinksBatch(group, 'pubmed_pubmed_refs');
+    refs.forEach((value, key) => refsMap.set(key, value));
+    await delay(process.env.NCBI_API_KEY ? 60 : 160);
+  }
+  if (includeCitedBy) {
+    for (const group of chunk(targets, ELINK_CITE_CHUNK)) {
+      const cites = await fetchLinksBatch(group, 'pubmed_pubmed_citedin');
+      cites.forEach((value, key) => citesMap.set(key, value));
+      await delay(process.env.NCBI_API_KEY ? 60 : 160);
+    }
+  }
+
+  const perNode = new Map<string, { refs: string[]; citedBy: string[] }>();
+  const allIds = new Set<string>(targets);
+  for (const id of targets) {
+    const refs = (refsMap.get(id) || []).filter((x) => x !== id).slice(0, REF_CAP);
+    const citedBy = (citesMap.get(id) || []).filter((x) => x !== id).slice(0, CITE_CAP);
+    perNode.set(id, { refs, citedBy });
+    [...refs, ...citedBy].forEach((x) => allIds.add(x));
+  }
+
+  const summaries = await fetchSummaries(Array.from(allIds));
+  const expandedSet = new Set(targets);
+
+  await bulkUpsertArticles(
+    targets.map((id) => {
+      const self = summaries.get(id);
+      const { refs, citedBy } = perNode.get(id) || { refs: [], citedBy: [] };
+      return {
+        pmid: id,
+        title: self?.title || `PMID ${id}`,
+        year: self?.year || '',
+        source: self?.source || '',
+        authors: self?.authors || [],
+        refs,
+        citedBy,
+        doi: self?.doi ?? null
+      };
+    })
+  );
+
+  await bulkUpsertStubs(
+    Array.from(allIds)
+      .filter((id) => !expandedSet.has(id))
+      .map((id) => {
+        const summary = summaries.get(id);
+        return {
+          pmid: id,
+          title: summary?.title || `PMID ${id}`,
+          year: summary?.year || '',
+          source: summary?.source || '',
+          authors: summary?.authors || [],
+          doi: summary?.doi ?? null
+        };
+      })
+  );
+}
+
+/**
+ * Distributed background crawling: expand a few random un-processed frontier
+ * articles (with both refs + citations). Called continuously by every visitor's
+ * browser via /api/pubmed/expand, so the shared Neon graph keeps growing at its
+ * edges. Returns how many nodes were expanded.
+ */
+export async function expandFrontier(count = 3): Promise<number> {
+  await ensureSchema();
+  const candidates = await getUnexpandedFrontier(count * 4);
+  const targets = candidates.slice(0, count);
+  if (targets.length === 0) return 0;
+  // Background crawl: fetch BOTH directions so the shared graph accumulates
+  // references and citations everywhere over time.
+  await batchExpand(targets, true);
+  return targets.length;
 }
 
 /**
@@ -75,16 +172,17 @@ export async function ingestNode(pmid: string, includeCitedBy = true): Promise<s
 }
 
 /**
- * Fast, structure-only expansion of a seed's neighbourhood to depth 2. Unlike
- * `crawl`, this batches elink/esummary across many nodes and SKIPS abstracts
- * (fetched lazily on click) — so a fresh DOI produces a rich, saved web in a
- * handful of requests instead of one-slow-node-at-a-time. Idempotent: neighbours
- * already expanded are left untouched. Returns the number of nodes expanded.
+ * Fast, structure-only expansion of a seed's neighbourhood to depth 2. Batches
+ * elink/esummary across all neighbours and skips abstracts (fetched on click) —
+ * so a fresh DOI produces a rich, saved web (with BOTH reference and citation
+ * edges) in a handful of requests. Idempotent: neighbours already expanded are
+ * left untouched. Returns the number of nodes expanded.
  */
-export async function expandNeighborhood(seed: string, maxNeighbors = 26): Promise<number> {
+export async function expandNeighborhood(seed: string, maxNeighbors = 24): Promise<number> {
   await ensureSchema();
 
-  // Make sure the seed itself is expanded (full ingest, with abstract).
+  // Make sure the seed itself is expanded (full ingest, with abstract + both
+  // references and citations).
   let seedRow = (await getArticles([seed])).get(seed);
   if (!seedRow?.expanded) {
     await ingestNode(seed, true);
@@ -97,61 +195,10 @@ export async function expandNeighborhood(seed: string, maxNeighbors = 26): Promi
   const toExpand = neighbours.filter((id) => !existing.get(id)?.expanded);
   if (toExpand.length === 0) return 0;
 
-  // References only for the neighbours (citations of old papers can be thousands
-  // of ids — huge payloads that stall the build). Chunked so elink stays happy.
-  const refsMap = new Map<string, string[]>();
-  for (const ids of chunk(toExpand, ELINK_CHUNK)) {
-    const refs = await fetchLinksBatch(ids, 'pubmed_pubmed_refs');
-    refs.forEach((value, key) => refsMap.set(key, value));
-    await delay(process.env.NCBI_API_KEY ? 60 : 180);
-  }
-
-  // Collect every id we'll need a title for (the neighbours + their references).
-  const perNode = new Map<string, string[]>();
-  const allIds = new Set<string>(toExpand);
-  for (const id of toExpand) {
-    const refs = (refsMap.get(id) || []).filter((x) => x !== id).slice(0, REF_CAP);
-    perNode.set(id, refs);
-    refs.forEach((x) => allIds.add(x));
-  }
-
-  const summaries = await fetchSummaries(Array.from(allIds));
-  const expandedSet = new Set(toExpand);
-
-  // Two bulk writes instead of hundreds of round trips: neighbours become
-  // EXPANDED rows (links, no abstract yet); their references become stubs.
-  await bulkUpsertArticles(
-    toExpand.map((id) => {
-      const self = summaries.get(id);
-      return {
-        pmid: id,
-        title: self?.title || `PMID ${id}`,
-        year: self?.year || '',
-        source: self?.source || '',
-        authors: self?.authors || [],
-        refs: perNode.get(id) || [],
-        citedBy: [],
-        doi: self?.doi ?? null
-      };
-    })
-  );
-
-  await bulkUpsertStubs(
-    Array.from(allIds)
-      .filter((id) => !expandedSet.has(id))
-      .map((id) => {
-        const summary = summaries.get(id);
-        return {
-          pmid: id,
-          title: summary?.title || `PMID ${id}`,
-          year: summary?.year || '',
-          source: summary?.source || '',
-          authors: summary?.authors || [],
-          doi: summary?.doi ?? null
-        };
-      })
-  );
-
+  // Refs-only here so the seed build stays under the serverless time limit; the
+  // seed itself already connects both its references and its citers (from its
+  // full ingest), and the background crawl fills citations in everywhere else.
+  await batchExpand(toExpand, false);
   return toExpand.length;
 }
 

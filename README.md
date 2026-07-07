@@ -166,11 +166,12 @@ Resolves a DOI (or a `doi.org` URL) to a PMID. **Checks Neon first** (`getPmidBy
 and only falls back to NCBI `esearch` on a miss — then stores the mapping so it is
 cached forever. Returns `{ pmid, doi, cached? }`.
 
-### `GET /api/pubmed/expand?n=<1..4>`
-The "help grow the shared graph" endpoint. Samples `n` random un‑expanded frontier
-PMIDs from Neon and ingests them (server‑side), deepening the shared database.
-Returns `{ expanded, total, expandedTotal }`. Every page load calls this a few times
-in the background.
+### `GET /api/pubmed/expand?n=<1..6>`
+On‑demand crawl endpoint. Samples `n` random un‑processed frontier PMIDs from Neon
+and **batch‑expands** them (`expandFrontier`) with **both references and citations**,
+writing everything in two bulk upserts. Returns `{ expanded, total, expandedTotal }`.
+The scheduled GitHub Actions crawler does the same work via a standalone script
+(no Vercel function), so this endpoint is mainly for manual/one‑off use.
 
 ### `GET /api/admin/ingest?pmid=<id>&depth=<1..4>&secret=<INGEST_SECRET>`
 Long‑running throttled crawl used for offline seeding. Guarded by `INGEST_SECRET`
@@ -274,15 +275,23 @@ the OS preference.
 
 ## Shared, database‑centric growth
 
-The database is the product. Every visitor helps it grow:
+The database is the product. It grows from two sources:
 
-- **Seed & DOI loads** store whatever they touch.
-- **Background contribution** — on each page load the client calls
-  `/api/pubmed/expand` a few times (staggered, then every ~45s while the tab is
-  visible). The server expands random un‑crawled frontier articles into Neon.
-- **Foreground auto‑expansion** — the visible graph quietly deepens its own stubs.
-- **DOI cache** — DOI→PMID mappings are stored, so a repeated DOI resolves from the
-  database (~0.2s) instead of hitting NCBI (~2.5s).
+- **A scheduled crawler** ([`.github/workflows/crawl.yml`](.github/workflows/crawl.yml))
+  runs [`scripts/crawl-frontier.mjs`](scripts/crawl-frontier.mjs) every ~30 minutes
+  in **GitHub Actions** — talking straight to Neon + NCBI, with no Vercel functions
+  involved (Hobby‑tier friendly). Each run batch‑expands frontier articles
+  (references **and** citations), so the whole literature graph steadily fills in
+  around the clock.
+- **Visitor activity** — **DOI loads** store a rich depth‑2 web; **clicks**
+  full‑ingest the clicked paper (abstract + both edge directions) and cache it.
+  **DOI→PMID** mappings are cached too, so a repeated DOI resolves from the database
+  (~0.2s) instead of hitting NCBI (~2.5s).
+
+Every article stores both its **references** (papers it cites) and its **cited‑by**
+(papers that cite it), so both edge directions connect. The seed and any clicked
+paper always have both immediately; the background crawl accumulates both everywhere
+else over time.
 
 Net effect: nothing already in the database is ever re‑fetched, and the graph gets
 bigger and faster the more the site is used.
@@ -297,9 +306,16 @@ Create `.env.local` (see [`.env.local.example`](.env.local.example)):
 |-----------------|----------|-------------------------------------------------------------------------|
 | `DATABASE_URL`  | yes      | Neon **pooled** connection string (`postgresql://…?sslmode=require`).    |
 | `INGEST_SECRET` | prod     | Guards `/api/admin/ingest`. Mandatory in production.                     |
-| `NCBI_API_KEY`  | no       | Raises NCBI's rate limit from 3→10 req/s; makes crawls faster.           |
+| `NCBI_API_KEY`  | no       | Raises NCBI's rate limit from 3→10 req/s; makes all crawling ~3× faster. |
 
-Set the same variables in the Vercel project's Environment Variables.
+Set the same variables in the Vercel project's Environment Variables, and add
+`DATABASE_URL` (+ optional `NCBI_API_KEY`) as **GitHub Actions repository secrets**
+(Settings → Secrets and variables → Actions) so the scheduled crawler can run.
+
+**About `NCBI_API_KEY`:** PubMed's E‑utilities API is rate‑limited to 3 requests/sec
+per IP without a key and 10/sec with one. Get a free key at
+[ncbi.nlm.nih.gov](https://www.ncbi.nlm.nih.gov/) → Account → **Settings** → **API
+Key Management**. Optional but recommended — it speeds up every crawl and avoids 429s.
 
 ---
 
@@ -336,7 +352,22 @@ curl "http://localhost:3000/api/admin/ingest?pmid=41817805&depth=4&secret=$INGES
 
 The crawl is throttled to respect NCBI's limits and is idempotent (already‑expanded
 nodes are reused). Depth 4 from the seed yields a few hundred interconnected papers.
-After that, ordinary traffic keeps the database growing via `/api/pubmed/expand`.
+
+### The scheduled crawler (keeps growing the graph)
+
+[`.github/workflows/crawl.yml`](.github/workflows/crawl.yml) runs
+[`scripts/crawl-frontier.mjs`](scripts/crawl-frontier.mjs) on a schedule
+(every ~30 min) inside GitHub Actions — it connects directly to Neon + NCBI, so it
+never touches a Vercel function (stays within the Hobby tier). Each run expands
+`CRAWL_NODES` (default 30) frontier articles with both references and citations.
+
+- **Enable it:** the workflow is active once it's on the default branch and the repo
+  has the `DATABASE_URL` secret (+ optional `NCBI_API_KEY`). Trigger a manual run
+  from the Actions tab ("Run workflow") to test.
+- **Run it locally:** `npm run crawl` (or `CRAWL_NODES=50 npm run crawl`).
+- **Tune cost:** GitHub Actions is free/unlimited for public repos; private repos get
+  2,000 min/month. Raise the cron interval or lower `CRAWL_NODES` if you're private
+  and near the limit.
 
 ---
 

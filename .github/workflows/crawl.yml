@@ -1,0 +1,41 @@
+name: Crawl frontier
+
+# Grows the shared Neon graph on a schedule, entirely inside GitHub Actions —
+# no Vercel functions involved, so it stays within the Hobby tier. Talks to
+# Neon + NCBI directly (see scripts/crawl-frontier.mjs).
+#
+# Setup (once): add repo secrets under Settings → Secrets and variables →
+# Actions:  DATABASE_URL (required, Neon pooled string), NCBI_API_KEY (optional).
+
+on:
+  schedule:
+    # Every 30 minutes (GitHub cron is best-effort and may run late).
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+    inputs:
+      nodes:
+        description: 'How many frontier nodes to expand this run'
+        default: '30'
+
+# Never let two crawls overlap.
+concurrency:
+  group: crawl-frontier
+  cancel-in-progress: false
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install driver
+        run: npm install @neondatabase/serverless@^0.10.4 --no-save --no-audit --no-fund
+      - name: Crawl
+        run: node scripts/crawl-frontier.mjs
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          NCBI_API_KEY: ${{ secrets.NCBI_API_KEY }}
+          CRAWL_NODES: ${{ github.event.inputs.nodes || '30' }}
